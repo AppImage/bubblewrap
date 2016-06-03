@@ -13,5 +13,5 @@ script:
   - make -j 2
   - make check
   - sudo make install
-  - sudio strip /usr/bin/bwrap
+  - sudo strip /usr/bin/bwrap
   - curl --upload-file /usr/bin/bwrap https://transfer.sh/bwrap
