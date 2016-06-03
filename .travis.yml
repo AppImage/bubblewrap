@@ -9,17 +9,8 @@ addons:
 script:
   - env NOCONFIGURE=1 ./autogen.sh
   - mkdir build
-  - cd build && ../configure
+  - cd build && ../configure --prefix=/usr
   - make -j 2
   - make check
-
-notifications:
-  # This is Colin's instance of Homu, in the future
-  # we'll move this to a production cluster.
-  webhooks: http://escher.verbum.org:54856/travis
-  email: false
-
-branches:
-  only:
-    - auto
-
+  - sudo make install
+  - curl --upload-file /usr/bin/bubblewrap https://transfer.sh/bubblewrap
