@@ -13,4 +13,4 @@ script:
   - make -j 2
   - make check
   - sudo make install
-  - curl --upload-file /usr/bin/bubblewrap https://transfer.sh/bubblewrap
+  - curl --upload-file /usr/bin/bwrap https://transfer.sh/bwrap
