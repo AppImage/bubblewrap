@@ -50,9 +50,11 @@ typedef int bool;
 void  die_with_error (const char *format,
                       ...) __attribute__((__noreturn__)) __attribute__((format (printf, 1, 2)));
 void  die (const char *format,
-           ...) __attribute__((__noreturn__));
+           ...) __attribute__((__noreturn__)) __attribute__((format (printf, 1, 2)));
 void  die_oom (void) __attribute__((__noreturn__));
 void  die_unless_label_valid (const char *label);
+
+void  fork_intermediate_child (void);
 
 void *xmalloc (size_t size);
 void *xcalloc (size_t size);
@@ -60,6 +62,7 @@ void *xrealloc (void  *ptr,
                 size_t size);
 char *xstrdup (const char *str);
 void  strfreev (char **str_array);
+void  xclearenv (void);
 void  xsetenv (const char *name,
                const char *value,
                int         overwrite);
@@ -75,6 +78,8 @@ bool  has_prefix (const char *str,
                   const char *prefix);
 bool  has_path_prefix (const char *str,
                        const char *prefix);
+bool  path_equal (const char *path1,
+                  const char *path2);
 int   fdwalk (int                     proc_fd,
               int                     (*cb)(void *data,
                                   int fd),
@@ -99,10 +104,17 @@ int   create_file (const char *path,
                    const char *content);
 int   ensure_file (const char *path,
                    mode_t      mode);
+int   ensure_dir (const char *path,
+                  mode_t      mode);
 int   get_file_mode (const char *pathname);
 int   mkdir_with_parents (const char *pathname,
                           int         mode,
                           bool        create_last);
+void create_pid_socketpair (int sockets[2]);
+void send_pid_on_socket (int socket);
+int  read_pid_from_socket (int socket);
+char *get_oldroot_path (const char *path);
+char *readlink_malloc (const char *pathname);
 
 /* syscall wrappers */
 int   raw_clone (unsigned long flags,

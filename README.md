@@ -53,8 +53,9 @@ Users
 This program can be shared by all container tools which perform
 non-root operation, such as:
 
- - [xdg-app](https://cgit.freedesktop.org/xdg-app/xdg-app)
+ - [Flatpak](http://www.flatpak.org)
  - [rpm-ostree unprivileged](https://github.com/projectatomic/rpm-ostree/pull/209)
+ - [bwrap-oci](https://github.com/projectatomic/bwrap-oci)
 
 We would also like to see this be available in Kubernetes/OpenShift
 clusters.  Having the ability for unprivileged users to use container
@@ -67,42 +68,23 @@ Usage
 bubblewrap works by creating a new, completely empty, mount
 namespace where the root is on a tmpfs that is invisible from the
 host, and will be automatically cleaned up when the last process
-exists. You can then use commandline options to construct the root
+exits. You can then use commandline options to construct the root
 filesystem and process environment and command to run in the
 namespace.
 
-A simple example is
-```
-bwrap --ro-bind / / bash
-```
-This will create a read-only bind mount of the host root at the
-sandbox root, and then start a bash.
-
-Another simple example would be a read-write chroot operation:
-```
-bwrap --bind /some/chroot/dir / bash
-```
-
-A more complex example is to run a with a custom (readonly) /usr,
-but your own (tmpfs) data, running in a PID and network namespace:
+There's a larger [demo script](./demos/bubblewrap-shell.sh) in the
+source code, but here's a trimmed down version which runs
+a new shell reusing the host's `/usr`.
 
 ```
-bwrap --ro-bind /usr /usr \
-   --tmpfs /tmp \
-   --proc /proc \
-   --dev /dev \
-   --ro-bind /etc/resolv.conf /etc/resolv.conf \
-   --symlink usr/lib /lib \
-   --symlink usr/lib64 /lib64 \
-   --symlink usr/bin /bin \
-   --symlink usr/sbin /sbin \
-   --chdir / \
-   --unshare-pid \
-   --unshare-net \
-   --dir /run/user/$(id -u) \
-   --setenv XDG_RUNTIME_DIR "/run/user/`id -u`" \
-   /bin/sh
+bwrap --ro-bind /usr /usr --symlink usr/lib64 /lib64 --proc /proc --dev /dev --unshare-pid bash
 ```
+
+This is an incomplete example, but useful for purposes of
+illustration.  More often, rather than creating a container using the
+host's filesystem tree, you want to target a chroot.  There, rather
+than creating the symlink `lib64 -> usr/lib64` in the tmpfs, you might
+have already created it in the target rootfs.
 
 Sandboxing
 ----------
@@ -123,7 +105,7 @@ sandbox. You can also change what the value of uid/gid should be in the sandbox.
 IPC namespaces ([CLONE_NEWIPC](http://linux.die.net/man/2/clone)): The sandbox will get its own copy of all the
 different forms of IPCs, like SysV shared memory and semaphores.
 
-PID namespaces ([CLONE_NEWPID](http://linux.die.net/man/2/clone)): The sandbox will not see any processes outside the sandbox. Additionally, bubblewrap will run a trivial pid1 inside your container to handle the requirements of reaping children in the sandbox. .This avoids what is known now as the [Docker pid 1 problem](https://blog.phusion.nl/2015/01/20/docker-and-the-pid-1-zombie-reaping-problem/).
+PID namespaces ([CLONE_NEWPID](http://linux.die.net/man/2/clone)): The sandbox will not see any processes outside the sandbox. Additionally, bubblewrap will run a trivial pid1 inside your container to handle the requirements of reaping children in the sandbox. This avoids what is known now as the [Docker pid 1 problem](https://blog.phusion.nl/2015/01/20/docker-and-the-pid-1-zombie-reaping-problem/).
 
 
 Network namespaces ([CLONE_NEWNET](http://linux.die.net/man/2/clone)): The sandbox will not see the network. Instead it will have its own network namespace with only a loopback device.
@@ -135,14 +117,14 @@ Seccomp filters: You can pass in seccomp filters that limit which syscalls can b
 Related project comparison: Firejail
 ------------------------------------
 
-[Firejail](https://github.com/netblue30/firejail/tree/master/src/firejail) is
-similar to xdg-app before bubblewrap was split out in that it combines
+[Firejail](https://github.com/netblue30/firejail/tree/master/src/firejail)
+is similar to Flatpak before bubblewrap was split out in that it combines
 a setuid tool with a lot of desktop-specific sandboxing features.  For
 example, Firejail knows about Pulseaudio, whereas bubblewrap does not.
 
 The bubblewrap authors believe it's much easier to audit a small
 setuid program, and keep features such as Pulseaudio filtering as an
-unprivileged process, as now occurs in xdg-app.
+unprivileged process, as now occurs in Flatpak.
 
 Also, @cgwalters thinks trying to
 [whitelist file paths](https://github.com/netblue30/firejail/blob/37a5a3545ef6d8d03dad8bbd888f53e13274c9e5/src/firejail/fs_whitelist.c#L176)
@@ -151,35 +133,42 @@ and the myriad ways in which system administrators may configure a
 system.  The bubblewrap approach is to only retain a few specific
 Linux capabilities such as `CAP_SYS_ADMIN`, but to always access the
 filesystem as the invoking uid.  This entirely closes
-[TOCTOCU attacks](https://cwe.mitre.org/data/definitions/367.html) and
+[TOCTTOU attacks](https://cwe.mitre.org/data/definitions/367.html) and
 such.
 
 Related project comparison: Sandstorm.io
 ----------------------------------------
 
-[Sandstorm.io](https://sandstorm.io/) also has a setuid helper
-process.  @cgwalters believes their setuid code is fairly good, but it
-could still make sense to unify on bubblewrap as a setuid core.  That
-hasn't been ruled out, but neither is it being actively pursued today.
+[Sandstorm.io](https://sandstorm.io/) requires unprivileged user
+namespaces to set up its sandbox, though it could easily be adapted
+to operate in a setuid mode as well. @cgwalters believes their code is
+fairly good, but it could still make sense to unify on bubblewrap.
+However, @kentonv (of Sandstorm) feels that while this makes sense
+in principle, the switching cost outweighs the practical benefits for
+now. This decision could be re-evaluated in the future, but it is not
+being actively pursued today.
 
 Related project comparison: runc/binctr
 ----------------------------------------
 
-[runc](https://github.com/opencontainers/runc) is similar to
-[systemd nspawn](https://www.freedesktop.org/software/systemd/man/systemd-nspawn.html)
-in that it is tooling intended to be invoked by root.  There is an
-effort to have runc optionally use
-[user namespaces](https://github.com/opencontainers/runc/issues/38),
-but no plans for any setuid support.
+[runC](https://github.com/opencontainers/runc) is currently working on
+supporting [rootless containers](https://github.com/opencontainers/runc/pull/774),
+without needing `setuid` or any other privileges during installation of
+runC (using unprivileged user namespaces rather than `setuid`),
+creation, and management of containers. However, the standard mode of
+using runC is similar to [systemd nspawn](https://www.freedesktop.org/software/systemd/man/systemd-nspawn.html)
+in that it is tooling intended to be invoked by root.
 
 The bubblewrap authors believe that runc and systemd-nspawn are not
-designed to be made setuid and are distant from supporting such a
-mode.
+designed to be made setuid, and are distant from supporting such a mode.
+However with rootless containers, runC will be able to fulfill certain usecases
+that bubblewrap supports (with the added benefit of being a standardised and
+complete OCI runtime).
 
 [binctr](https://github.com/jfrazelle/binctr) is just a wrapper for
-runc, so inherits all of its design tradeoffs.
+runC, so inherits all of its design tradeoffs.
 
-Whats with the name ?!
+What's with the name?!
 ----------------------
 
 The name bubblewrap was chosen to convey that this

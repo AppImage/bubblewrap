@@ -19,8 +19,16 @@
 
 #include "utils.h"
 #include <sys/syscall.h>
+#include <sys/socket.h>
 #ifdef HAVE_SELINUX
 #include <selinux/selinux.h>
+#endif
+
+#ifndef HAVE_SELINUX_2_3
+/* libselinux older than 2.3 weren't const-correct */
+#define setexeccon(x) setexeccon ((security_context_t) x)
+#define setfscreatecon(x) setfscreatecon ((security_context_t) x)
+#define security_check_context(x) security_check_context ((security_context_t) x)
 #endif
 
 void
@@ -28,6 +36,8 @@ die_with_error (const char *format, ...)
 {
   va_list args;
   int errsv;
+
+  fprintf (stderr, "bwrap: ");
 
   errsv = errno;
 
@@ -45,6 +55,8 @@ die (const char *format, ...)
 {
   va_list args;
 
+  fprintf (stderr, "bwrap: ");
+
   va_start (args, format);
   vfprintf (stderr, format, args);
   va_end (args);
@@ -60,7 +72,7 @@ die_unless_label_valid (const char *label)
 #ifdef HAVE_SELINUX
   if (is_selinux_enabled () == 1)
     {
-      if (security_check_context ((security_context_t) label) < 0)
+      if (security_check_context (label) < 0)
         die_with_error ("invalid label %s", label);
       return;
     }
@@ -71,8 +83,21 @@ die_unless_label_valid (const char *label)
 void
 die_oom (void)
 {
-  puts ("Out of memory");
+  fputs ("Out of memory\n", stderr);
   exit (1);
+}
+
+/* Fork, return in child, exiting the previous parent */
+void
+fork_intermediate_child (void)
+{
+  int pid = fork ();
+  if (pid == -1)
+    die_with_error ("Can't fork for --pidns");
+
+  /* Parent is an process not needed */
+  if (pid != 0)
+    exit (0);
 }
 
 void *
@@ -173,10 +198,50 @@ has_path_prefix (const char *str,
 }
 
 bool
+path_equal (const char *path1,
+            const char *path2)
+{
+  while (TRUE)
+    {
+      /* Skip consecutive slashes to reach next path
+         element */
+      while (*path1 == '/')
+        path1++;
+      while (*path2 == '/')
+        path2++;
+
+      /* No more prefix path elements? Done! */
+      if (*path1 == 0 || *path2 == 0)
+        return *path1 == 0 && *path2 == 0;
+
+      /* Compare path element */
+      while (*path1 != 0 && *path1 != '/')
+        {
+          if (*path1 != *path2)
+            return FALSE;
+          path1++;
+          path2++;
+        }
+
+      /* Matched path1 path element, must be entire path element */
+      if (*path2 != '/' && *path2 != 0)
+        return FALSE;
+    }
+}
+
+
+bool
 has_prefix (const char *str,
             const char *prefix)
 {
   return strncmp (str, prefix, strlen (prefix)) == 0;
+}
+
+void
+xclearenv (void)
+{
+  if (clearenv () != 0)
+    die_with_error ("clearenv failed");
 }
 
 void
@@ -397,9 +462,14 @@ ensure_file (const char *path,
 
   /* We check this ahead of time, otherwise
      the create file will fail in the read-only
-     case with EROFD instead of EEXIST */
+     case with EROFS instead of EEXIST.
+
+     We're trying to set up a mount point for a non-directory, so any
+     non-directory, non-symlink is acceptable - it doesn't necessarily
+     have to be a regular file. */
   if (stat (path, &buf) ==  0 &&
-      S_ISREG (buf.st_mode))
+      !S_ISDIR (buf.st_mode) &&
+      !S_ISLNK (buf.st_mode))
     return 0;
 
   if (create_file (path, mode, NULL) != 0 &&  errno != EEXIST)
@@ -556,6 +626,34 @@ get_file_mode (const char *pathname)
   return buf.st_mode & S_IFMT;
 }
 
+int
+ensure_dir (const char *path,
+            mode_t      mode)
+{
+  struct stat buf;
+
+  /* We check this ahead of time, otherwise
+     the mkdir call can fail in the read-only
+     case with EROFS instead of EEXIST on some
+     filesystems (such as NFS) */
+  if (stat (path, &buf) == 0)
+    {
+      if (!S_ISDIR (buf.st_mode))
+        {
+          errno = ENOTDIR;
+          return -1;
+        }
+
+      return 0;
+    }
+
+  if (mkdir (path, mode) == -1 && errno != EEXIST)
+    return -1;
+
+  return 0;
+}
+
+
 /* Sets errno on error (!= 0) */
 int
 mkdir_with_parents (const char *pathname,
@@ -564,7 +662,6 @@ mkdir_with_parents (const char *pathname,
 {
   cleanup_free char *fn = NULL;
   char *p;
-  struct stat buf;
 
   if (pathname == NULL || *pathname == '\0')
     {
@@ -591,16 +688,8 @@ mkdir_with_parents (const char *pathname,
       if (!create_last && p == NULL)
         break;
 
-      if (stat (fn, &buf) !=  0)
-        {
-          if (mkdir (fn, mode) == -1 && errno != EEXIST)
-            return -1;
-        }
-      else if (!S_ISDIR (buf.st_mode))
-        {
-          errno = ENOTDIR;
-          return -1;
-        }
+      if (ensure_dir (fn, mode) != 0)
+        return -1;
 
       if (p)
         {
@@ -612,6 +701,117 @@ mkdir_with_parents (const char *pathname,
   while (p);
 
   return 0;
+}
+
+/* Send an ucred with current pid/uid/gid over a socket, it can be
+   read back with read_pid_from_socket(), and then the kernel has
+   translated it between namespaces as needed. */
+void
+send_pid_on_socket (int socket)
+{
+  char buf[1] = { 0 };
+  struct msghdr msg = {};
+  struct iovec iov = { buf, sizeof (buf) };
+  const ssize_t control_len_snd = CMSG_SPACE(sizeof(struct ucred));
+  char control_buf_snd[control_len_snd];
+  struct cmsghdr *cmsg;
+  struct ucred *cred;
+
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control_buf_snd;
+  msg.msg_controllen = control_len_snd;
+
+  cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_CREDENTIALS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+  cred = (struct ucred *)CMSG_DATA(cmsg);
+
+  cred->pid = getpid ();
+  cred->uid = geteuid ();
+  cred->gid = getegid ();
+
+  if (sendmsg (socket, &msg, 0) < 0)
+    die_with_error ("Can't send pid");
+}
+
+void
+create_pid_socketpair (int sockets[2])
+{
+  int enable = 1;
+
+  if (socketpair (AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
+    die_with_error ("Can't create intermediate pids socket");
+
+  if (setsockopt (sockets[0], SOL_SOCKET, SO_PASSCRED, &enable, sizeof (enable)) < 0)
+    die_with_error ("Can't set SO_PASSCRED");
+}
+
+int
+read_pid_from_socket (int socket)
+{
+  char recv_buf[1] = { 0 };
+  struct msghdr msg = {};
+  struct iovec iov = { recv_buf, sizeof (recv_buf) };
+  const ssize_t control_len_rcv = CMSG_SPACE(sizeof(struct ucred));
+  char control_buf_rcv[control_len_rcv];
+  struct cmsghdr* cmsg;
+
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control_buf_rcv;
+  msg.msg_controllen = control_len_rcv;
+
+  if (recvmsg (socket, &msg, 0) < 0)
+    die_with_error ("Cant read pid from socket");
+
+  if (msg.msg_controllen <= 0)
+    die ("Unexpected short read from pid socket");
+
+  for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
+    {
+      const unsigned payload_len = cmsg->cmsg_len - CMSG_LEN(0);
+      if (cmsg->cmsg_level == SOL_SOCKET &&
+          cmsg->cmsg_type == SCM_CREDENTIALS &&
+          payload_len == sizeof(struct ucred))
+        {
+          struct ucred *cred = (struct ucred *)CMSG_DATA(cmsg);
+          return cred->pid;
+        }
+    }
+  die ("No pid returned on socket");
+}
+
+/* Sets errno on error (== NULL),
+ * Always ensures terminating zero */
+char *
+readlink_malloc (const char *pathname)
+{
+  size_t size = 50;
+  ssize_t n;
+  cleanup_free char *value = NULL;
+
+  do
+    {
+      size *= 2;
+      value = xrealloc (value, size);
+      n = readlink (pathname, value, size - 1);
+      if (n < 0)
+        return NULL;
+    }
+  while (size - 2 < n);
+
+  value[n] = 0;
+  return steal_pointer (&value);
+}
+
+char *
+get_oldroot_path (const char *path)
+{
+  while (*path == '/')
+    path++;
+  return strconcat ("/oldroot/", path);
 }
 
 int
@@ -660,7 +860,7 @@ label_create_file (const char *file_label)
 {
 #ifdef HAVE_SELINUX
   if (is_selinux_enabled () > 0 && file_label)
-    return setfscreatecon ((security_context_t) file_label);
+    return setfscreatecon (file_label);
 #endif
   return 0;
 }
@@ -670,7 +870,7 @@ label_exec (const char *exec_label)
 {
 #ifdef HAVE_SELINUX
   if (is_selinux_enabled () > 0 && exec_label)
-    return setexeccon ((security_context_t) exec_label);
+    return setexeccon (exec_label);
 #endif
   return 0;
 }

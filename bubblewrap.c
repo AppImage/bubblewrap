@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/eventfd.h>
+#include <sys/fsuid.h>
 #include <sys/signalfd.h>
 #include <sys/capability.h>
 #include <sys/prctl.h>
@@ -41,15 +42,78 @@
 #define CLONE_NEWCGROUP 0x02000000 /* New cgroup namespace */
 #endif
 
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(expression) \
+  (__extension__                                                              \
+    ({ long int __result;                                                     \
+       do __result = (long int) (expression);                                 \
+       while (__result == -1L && errno == EINTR);                             \
+       __result; }))
+#endif
+
 /* Globals to avoid having to use getuid(), since the uid/gid changes during runtime */
-static uid_t uid;
-static gid_t gid;
-static bool is_privileged;
+static uid_t real_uid;
+static gid_t real_gid;
+static uid_t overflow_uid;
+static gid_t overflow_gid;
+static bool is_privileged; /* See acquire_privs() */
 static const char *argv0;
 static const char *host_tty_dev;
 static int proc_fd = -1;
-static char *opt_exec_label = NULL;
-static char *opt_file_label = NULL;
+static const char *opt_exec_label = NULL;
+static const char *opt_file_label = NULL;
+static bool opt_as_pid_1;
+
+const char *opt_chdir_path = NULL;
+bool opt_unshare_user = FALSE;
+bool opt_unshare_user_try = FALSE;
+bool opt_unshare_pid = FALSE;
+bool opt_unshare_ipc = FALSE;
+bool opt_unshare_net = FALSE;
+bool opt_unshare_uts = FALSE;
+bool opt_unshare_cgroup = FALSE;
+bool opt_unshare_cgroup_try = FALSE;
+bool opt_needs_devpts = FALSE;
+bool opt_new_session = FALSE;
+bool opt_die_with_parent = FALSE;
+uid_t opt_sandbox_uid = -1;
+gid_t opt_sandbox_gid = -1;
+int opt_sync_fd = -1;
+int opt_block_fd = -1;
+int opt_userns_block_fd = -1;
+int opt_info_fd = -1;
+int opt_json_status_fd = -1;
+int opt_seccomp_fd = -1;
+const char *opt_sandbox_hostname = NULL;
+char *opt_args_data = NULL;  /* owned */
+int opt_userns_fd = -1;
+int opt_userns2_fd = -1;
+int opt_pidns_fd = -1;
+int next_perms = -1;
+
+#define CAP_TO_MASK_0(x) (1L << ((x) & 31))
+#define CAP_TO_MASK_1(x) CAP_TO_MASK_0(x - 32)
+
+typedef struct _NsInfo NsInfo;
+
+struct _NsInfo {
+  const char *name;
+  bool       *do_unshare;
+  ino_t       id;
+};
+
+static NsInfo ns_infos[] = {
+  {"cgroup", &opt_unshare_cgroup, 0},
+  {"ipc",    &opt_unshare_ipc,    0},
+  {"mnt",    NULL,                0},
+  {"net",    &opt_unshare_net,    0},
+  {"pid",    &opt_unshare_pid,    0},
+  /* user namespace info omitted because it
+   * is not (yet) valid when we obtain the
+   * namespace info (get un-shared later) */
+  {"uts",    &opt_unshare_uts,    0},
+  {NULL,     NULL,                0}
+};
 
 typedef enum {
   SETUP_BIND_MOUNT,
@@ -62,8 +126,17 @@ typedef enum {
   SETUP_MAKE_DIR,
   SETUP_MAKE_FILE,
   SETUP_MAKE_BIND_FILE,
+  SETUP_MAKE_RO_BIND_FILE,
   SETUP_MAKE_SYMLINK,
+  SETUP_REMOUNT_RO_NO_RECURSIVE,
+  SETUP_SET_HOSTNAME,
+  SETUP_CHMOD,
 } SetupOpType;
+
+typedef enum {
+  NO_CREATE_DEST = (1 << 0),
+  ALLOW_NOTEXIST = (2 << 0),
+} SetupOpFlag;
 
 typedef struct _SetupOp SetupOp;
 
@@ -73,6 +146,8 @@ struct _SetupOp
   const char *source;
   const char *dest;
   int         fd;
+  SetupOpFlag flags;
+  int         perms;
   SetupOp    *next;
 };
 
@@ -81,6 +156,7 @@ typedef struct _LockFile LockFile;
 struct _LockFile
 {
   const char *path;
+  int         fd;
   LockFile   *next;
 };
 
@@ -96,12 +172,15 @@ enum {
   PRIV_SEP_OP_TMPFS_MOUNT,
   PRIV_SEP_OP_DEVPTS_MOUNT,
   PRIV_SEP_OP_MQUEUE_MOUNT,
+  PRIV_SEP_OP_REMOUNT_RO_NO_RECURSIVE,
+  PRIV_SEP_OP_SET_HOSTNAME,
 };
 
 typedef struct
 {
   uint32_t op;
   uint32_t flags;
+  uint32_t perms;
   uint32_t arg1_offset;
   uint32_t arg2_offset;
 } PrivSepOp;
@@ -113,6 +192,7 @@ setup_op_new (SetupOpType type)
 
   op->type = type;
   op->fd = -1;
+  op->flags = 0;
   if (last_op != NULL)
     last_op->next = op;
   else
@@ -141,12 +221,14 @@ lock_file_new (const char *path)
 static void
 usage (int ecode, FILE *out)
 {
-  fprintf (out, "usage: %s [OPTIONS...] COMMAND [ARGS...]\n\n", argv0);
+  fprintf (out, "usage: %s [OPTIONS...] [--] COMMAND [ARGS...]\n\n", argv0);
 
   fprintf (out,
            "    --help                       Print this help\n"
            "    --version                    Print version\n"
-           "    --args FD                    Parse nul-separated args from FD\n"
+           "    --args FD                    Parse NUL-separated args from FD\n"
+           "    --unshare-all                Unshare every namespace we support by default\n"
+           "    --share-net                  Retain the network namespace (can only combine with --unshare-all)\n"
            "    --unshare-user               Create new user namespace (may be automatically implied if not setuid)\n"
            "    --unshare-user-try           Create new user namespace if possible else continue by skipping it\n"
            "    --unshare-ipc                Create new ipc namespace\n"
@@ -155,41 +237,77 @@ usage (int ecode, FILE *out)
            "    --unshare-uts                Create new uts namespace\n"
            "    --unshare-cgroup             Create new cgroup namespace\n"
            "    --unshare-cgroup-try         Create new cgroup namespace if possible else continue by skipping it\n"
-           "    --uid UID                    Custom uid in the sandbox (requires --unshare-user)\n"
-           "    --gid GID                    Custon gid in the sandbox (requires --unshare-user)\n"
+           "    --userns FD                  Use this user namespace (cannot combine with --unshare-user)\n"
+           "    --userns2 FD                 After setup switch to this user namespace, only useful with --userns\n"
+           "    --pidns FD                   Use this user namespace (as parent namespace if using --unshare-pid)\n"
+           "    --uid UID                    Custom uid in the sandbox (requires --unshare-user or --userns)\n"
+           "    --gid GID                    Custom gid in the sandbox (requires --unshare-user or --userns)\n"
+           "    --hostname NAME              Custom hostname in the sandbox (requires --unshare-uts)\n"
            "    --chdir DIR                  Change directory to DIR\n"
+           "    --clearenv                   Unset all environment variables\n"
            "    --setenv VAR VALUE           Set an environment variable\n"
            "    --unsetenv VAR               Unset an environment variable\n"
            "    --lock-file DEST             Take a lock on DEST while sandbox is running\n"
            "    --sync-fd FD                 Keep this fd open while sandbox is running\n"
            "    --bind SRC DEST              Bind mount the host path SRC on DEST\n"
+           "    --bind-try SRC DEST          Equal to --bind but ignores non-existent SRC\n"
            "    --dev-bind SRC DEST          Bind mount the host path SRC on DEST, allowing device access\n"
+           "    --dev-bind-try SRC DEST      Equal to --dev-bind but ignores non-existent SRC\n"
            "    --ro-bind SRC DEST           Bind mount the host path SRC readonly on DEST\n"
-           "    --exec-label LABEL           Exec Label for the sandbox\n"
+           "    --ro-bind-try SRC DEST       Equal to --ro-bind but ignores non-existent SRC\n"
+           "    --remount-ro DEST            Remount DEST as readonly; does not recursively remount\n"
+           "    --exec-label LABEL           Exec label for the sandbox\n"
            "    --file-label LABEL           File label for temporary sandbox content\n"
-           "    --proc DEST                  Mount procfs on DEST\n"
+           "    --proc DEST                  Mount new procfs on DEST\n"
            "    --dev DEST                   Mount new dev on DEST\n"
            "    --tmpfs DEST                 Mount new tmpfs on DEST\n"
            "    --mqueue DEST                Mount new mqueue on DEST\n"
            "    --dir DEST                   Create dir at DEST\n"
-           "    --file FD DEST               Copy from FD to dest DEST\n"
+           "    --file FD DEST               Copy from FD to destination DEST\n"
            "    --bind-data FD DEST          Copy from FD to file which is bind-mounted on DEST\n"
+           "    --ro-bind-data FD DEST       Copy from FD to file which is readonly bind-mounted on DEST\n"
            "    --symlink SRC DEST           Create symlink at DEST with target SRC\n"
            "    --seccomp FD                 Load and use seccomp rules from FD\n"
+           "    --block-fd FD                Block on FD until some data to read is available\n"
+           "    --userns-block-fd FD         Block on FD until the user namespace is ready\n"
+           "    --info-fd FD                 Write information about the running container to FD\n"
+           "    --json-status-fd FD          Write container status to FD as multiple JSON documents\n"
+           "    --new-session                Create a new terminal session\n"
+           "    --die-with-parent            Kills with SIGKILL child process (COMMAND) when bwrap or bwrap's parent dies.\n"
+           "    --as-pid-1                   Do not install a reaper process with PID=1\n"
+           "    --cap-add CAP                Add cap CAP when running as privileged user\n"
+           "    --cap-drop CAP               Drop cap CAP when running as privileged user\n"
+           "    --perms OCTAL                Set permissions of next argument (--bind-data, --file, etc.)\n"
+           "    --chmod OCTAL PATH           Change permissions of PATH (must already exist)\n"
           );
   exit (ecode);
+}
+
+/* If --die-with-parent was specified, use PDEATHSIG to ensure SIGKILL
+ * is sent to the current process when our parent dies.
+ */
+static void
+handle_die_with_parent (void)
+{
+  if (opt_die_with_parent && prctl (PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0)
+    die_with_error ("prctl");
 }
 
 static void
 block_sigchild (void)
 {
   sigset_t mask;
+  int status;
 
   sigemptyset (&mask);
   sigaddset (&mask, SIGCHLD);
 
   if (sigprocmask (SIG_BLOCK, &mask, NULL) == -1)
     die_with_error ("sigprocmask");
+
+  /* Reap any outstanding zombies that we may have inherited */
+  while (waitpid (-1, &status, WNOHANG) > 0)
+    ;
 }
 
 static void
@@ -222,14 +340,66 @@ close_extra_fds (void *data, int fd)
   return 0;
 }
 
+static int
+propagate_exit_status (int status)
+{
+  if (WIFEXITED (status))
+    return WEXITSTATUS (status);
+
+  /* The process died of a signal, we can't really report that, but we
+   * can at least be bash-compatible. The bash manpage says:
+   *   The return value of a simple command is its
+   *   exit status, or 128+n if the command is
+   *   terminated by signal n.
+   */
+  if (WIFSIGNALED (status))
+    return 128 + WTERMSIG (status);
+
+  /* Weird? */
+  return 255;
+}
+
+static void
+dump_info (int fd, const char *output, bool exit_on_error)
+{
+  size_t len = strlen (output);
+  if (write_to_fd (fd, output, len))
+    {
+      if (exit_on_error)
+        die_with_error ("Write to info_fd");
+    }
+}
+
+static void
+report_child_exit_status (int exitc, int setup_finished_fd)
+{
+  ssize_t s;
+  char data[2];
+  cleanup_free char *output = NULL;
+  if (opt_json_status_fd == -1 || setup_finished_fd == -1)
+    return;
+
+  s = TEMP_FAILURE_RETRY (read (setup_finished_fd, data, sizeof data));
+  if (s == -1 && errno != EAGAIN)
+    die_with_error ("read eventfd");
+  if (s != 1) // Is 0 if pipe closed before exec, is 2 if closed after exec.
+    return;
+
+  output = xasprintf ("{ \"exit-code\": %i }\n", exitc);
+  dump_info (opt_json_status_fd, output, FALSE);
+  close (opt_json_status_fd);
+  opt_json_status_fd = -1;
+  close (setup_finished_fd);
+}
+
 /* This stays around for as long as the initial process in the app does
  * and when that exits it exits, propagating the exit status. We do this
  * by having pid 1 in the sandbox detect this exit and tell the monitor
  * the exit status via a eventfd. We also track the exit of the sandbox
  * pid 1 via a signalfd for SIGCHLD, and exit with an error in this case.
  * This is to catch e.g. problems during setup. */
-static void
-monitor_child (int event_fd)
+static int
+monitor_child (int event_fd, pid_t child_pid, int setup_finished_fd)
 {
   int res;
   uint64_t val;
@@ -239,10 +409,21 @@ monitor_child (int event_fd)
   struct pollfd fds[2];
   int num_fds;
   struct signalfd_siginfo fdsi;
-  int dont_close[] = { event_fd, -1 };
+  int dont_close[] = {-1, -1, -1, -1};
+  int j = 0;
+  int exitc;
+  pid_t died_pid;
+  int died_status;
 
   /* Close all extra fds in the monitoring process.
      Any passed in fds have been passed on to the child anyway. */
+  if (event_fd != -1)
+    dont_close[j++] = event_fd;
+  if (opt_json_status_fd != -1)
+    dont_close[j++] = opt_json_status_fd;
+  if (setup_finished_fd != -1)
+    dont_close[j++] = setup_finished_fd;
+  assert (j < sizeof(dont_close)/sizeof(*dont_close));
   fdwalk (proc_fd, close_extra_fds, dont_close);
 
   sigemptyset (&mask);
@@ -278,21 +459,38 @@ monitor_child (int event_fd)
           if (s == -1 && errno != EINTR && errno != EAGAIN)
             die_with_error ("read eventfd");
           else if (s == 8)
-            exit ((int) val - 1);
+            {
+              exitc = (int) val - 1;
+              report_child_exit_status (exitc, setup_finished_fd);
+              return exitc;
+            }
         }
 
+      /* We need to read the signal_fd, or it will keep polling as read,
+       * however we ignore the details as we get them from waitpid
+       * below anyway */
       s = read (signal_fd, &fdsi, sizeof (struct signalfd_siginfo));
       if (s == -1 && errno != EINTR && errno != EAGAIN)
+        die_with_error ("read signalfd");
+
+      /* We may actually get several sigchld compressed into one
+         SIGCHLD, so we have to handle all of them. */
+      while ((died_pid = waitpid (-1, &died_status, WNOHANG)) > 0)
         {
-          die_with_error ("read signalfd");
-        }
-      else if (s == sizeof (struct signalfd_siginfo))
-        {
-          if (fdsi.ssi_signo != SIGCHLD)
-            die ("Read unexpected signal\n");
-          exit (fdsi.ssi_status);
+          /* We may be getting sigchild from other children too. For instance if
+             someone created a child process, and then exec:ed bubblewrap. Ignore them */
+          if (died_pid == child_pid)
+            {
+              exitc = propagate_exit_status (died_status);
+              report_child_exit_status (exitc, setup_finished_fd);
+              return exitc;
+            }
         }
     }
+
+  die ("Should not be reached");
+
+  return 0;
 }
 
 /* This is pid 1 in the app sandbox. It is needed because we're using
@@ -303,7 +501,7 @@ monitor_child (int event_fd)
  * When there are no other processes in the sandbox the wait will return
  * ECHILD, and we then exit pid 1 to clean up the sandbox. */
 static int
-do_init (int event_fd, pid_t initial_pid)
+do_init (int event_fd, pid_t initial_pid, struct sock_fprog *seccomp_prog)
 {
   int initial_exit_status = 1;
   LockFile *lock;
@@ -325,7 +523,15 @@ do_init (int event_fd, pid_t initial_pid)
         die_with_error ("Unable to lock file %s", lock->path);
 
       /* Keep fd open to hang on to lock */
+      lock->fd = fd;
     }
+
+  /* Optionally bind our lifecycle to that of the caller */
+  handle_die_with_parent ();
+
+  if (seccomp_prog != NULL &&
+      prctl (PR_SET_SECCOMP, SECCOMP_MODE_FILTER, seccomp_prog) != 0)
+    die_with_error ("prctl(PR_SET_SECCOMP)");
 
   while (TRUE)
     {
@@ -333,18 +539,20 @@ do_init (int event_fd, pid_t initial_pid)
       int status;
 
       child = wait (&status);
-      if (child == initial_pid && event_fd != -1)
+      if (child == initial_pid)
         {
-          uint64_t val;
-          int res UNUSED;
+          initial_exit_status = propagate_exit_status (status);
 
-          if (WIFEXITED (status))
-            initial_exit_status = WEXITSTATUS (status);
+          if(event_fd != -1)
+            {
+              uint64_t val;
+              int res UNUSED;
 
-          val = initial_exit_status + 1;
-          res = write (event_fd, &val, 8);
-          /* Ignore res, if e.g. the parent died and closed event_fd
-             we don't want to error out here */
+              val = initial_exit_status + 1;
+              res = write (event_fd, &val, 8);
+              /* Ignore res, if e.g. the parent died and closed event_fd
+                 we don't want to error out here */
+            }
         }
 
       if (child == -1 && errno != EINTR)
@@ -355,16 +563,92 @@ do_init (int event_fd, pid_t initial_pid)
         }
     }
 
+  /* Close FDs. */
+  for (lock = lock_files; lock != NULL; lock = lock->next)
+    {
+      if (lock->fd >= 0)
+        {
+          close (lock->fd);
+          lock->fd = -1;
+        }
+    }
+
   return initial_exit_status;
 }
 
+#define CAP_TO_MASK_0(x) (1L << ((x) & 31))
+#define CAP_TO_MASK_1(x) CAP_TO_MASK_0(x - 32)
+
+/* Set if --cap-add or --cap-drop were used */
+static bool opt_cap_add_or_drop_used;
+/* The capability set we'll target, used if above is true */
+static uint32_t requested_caps[2] = {0, 0};
+
 /* low 32bit caps needed */
-#define REQUIRED_CAPS_0 (CAP_TO_MASK (CAP_SYS_ADMIN) | CAP_TO_MASK (CAP_SYS_CHROOT) | CAP_TO_MASK (CAP_NET_ADMIN) | CAP_TO_MASK (CAP_SETUID) | CAP_TO_MASK (CAP_SETGID))
+/* CAP_SYS_PTRACE is needed to dereference the symlinks in /proc/<pid>/ns/, see namespaces(7) */
+#define REQUIRED_CAPS_0 (CAP_TO_MASK_0 (CAP_SYS_ADMIN) | CAP_TO_MASK_0 (CAP_SYS_CHROOT) | CAP_TO_MASK_0 (CAP_NET_ADMIN) | CAP_TO_MASK_0 (CAP_SETUID) | CAP_TO_MASK_0 (CAP_SETGID) | CAP_TO_MASK_0 (CAP_SYS_PTRACE))
 /* high 32bit caps needed */
 #define REQUIRED_CAPS_1 0
 
 static void
-acquire_caps (void)
+set_required_caps (void)
+{
+  struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+  struct __user_cap_data_struct data[2] = { { 0 } };
+
+  /* Drop all non-require capabilities */
+  data[0].effective = REQUIRED_CAPS_0;
+  data[0].permitted = REQUIRED_CAPS_0;
+  data[0].inheritable = 0;
+  data[1].effective = REQUIRED_CAPS_1;
+  data[1].permitted = REQUIRED_CAPS_1;
+  data[1].inheritable = 0;
+  if (capset (&hdr, data) < 0)
+    die_with_error ("capset failed");
+}
+
+static void
+drop_all_caps (bool keep_requested_caps)
+{
+  struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+  struct __user_cap_data_struct data[2] = { { 0 } };
+
+  if (keep_requested_caps)
+    {
+      /* Avoid calling capset() unless we need to; currently
+       * systemd-nspawn at least is known to install a seccomp
+       * policy denying capset() for dubious reasons.
+       * <https://github.com/projectatomic/bubblewrap/pull/122>
+       */
+      if (!opt_cap_add_or_drop_used && real_uid == 0)
+        {
+          assert (!is_privileged);
+          return;
+        }
+      data[0].effective = requested_caps[0];
+      data[0].permitted = requested_caps[0];
+      data[0].inheritable = requested_caps[0];
+      data[1].effective = requested_caps[1];
+      data[1].permitted = requested_caps[1];
+      data[1].inheritable = requested_caps[1];
+    }
+
+  if (capset (&hdr, data) < 0)
+    {
+      /* While the above logic ensures we don't call capset() for the primary
+       * process unless configured to do so, we still try to drop privileges for
+       * the init process unconditionally. Since due to the systemd seccomp
+       * filter that will fail, let's just ignore it.
+       */
+      if (errno == EPERM && real_uid == 0 && !is_privileged)
+        return;
+      else
+        die_with_error ("capset failed");
+    }
+}
+
+static bool
+has_caps (void)
 {
   struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
   struct __user_cap_data_struct data[2] = { { 0 } };
@@ -372,53 +656,208 @@ acquire_caps (void)
   if (capget (&hdr, data)  < 0)
     die_with_error ("capget failed");
 
-  if (((data[0].effective & REQUIRED_CAPS_0) == REQUIRED_CAPS_0) &&
-      ((data[0].permitted & REQUIRED_CAPS_0) == REQUIRED_CAPS_0) &&
-      ((data[1].effective & REQUIRED_CAPS_1) == REQUIRED_CAPS_1) &&
-      ((data[1].permitted & REQUIRED_CAPS_1) == REQUIRED_CAPS_1))
-    is_privileged = TRUE;
+  return data[0].permitted != 0 || data[1].permitted != 0;
+}
 
-  if (getuid () != geteuid ())
+/* Most of the code here is used both to add caps to the ambient capabilities
+ * and drop caps from the bounding set.  Handle both cases here and add
+ * drop_cap_bounding_set/set_ambient_capabilities wrappers to facilitate its usage.
+ */
+static void
+prctl_caps (uint32_t *caps, bool do_cap_bounding, bool do_set_ambient)
+{
+  unsigned long cap;
+
+  /* We ignore both EINVAL and EPERM, as we are actually relying
+   * on PR_SET_NO_NEW_PRIVS to ensure the right capabilities are
+   * available.  EPERM in particular can happen with old, buggy
+   * kernels.  See:
+   *  https://github.com/projectatomic/bubblewrap/pull/175#issuecomment-278051373
+   *  https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/security/commoncap.c?id=160da84dbb39443fdade7151bc63a88f8e953077
+   */
+  for (cap = 0; cap <= CAP_LAST_CAP; cap++)
     {
-      /* Tell kernel not clear capabilities when dropping root */
-      if (prctl (PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
-        die_with_error ("prctl(PR_SET_KEEPCAPS) failed");
+      bool keep = FALSE;
+      if (cap < 32)
+        {
+          if (CAP_TO_MASK_0 (cap) & caps[0])
+            keep = TRUE;
+        }
+      else
+        {
+          if (CAP_TO_MASK_1 (cap) & caps[1])
+            keep = TRUE;
+        }
 
-      /* Drop root uid, but retain the required permitted caps */
-      if (setuid (getuid ()) < 0)
-        die_with_error ("unable to drop privs");
+      if (keep && do_set_ambient)
+        {
+#ifdef PR_CAP_AMBIENT
+          int res = prctl (PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0);
+          if (res == -1 && !(errno == EINVAL || errno == EPERM))
+            die_with_error ("Adding ambient capability %ld", cap);
+#else
+          /* We ignore the EINVAL that results from not having PR_CAP_AMBIENT
+           * in the current kernel at runtime, so also ignore not having it
+           * in the current kernel headers at compile-time */
+#endif
+        }
+
+      if (!keep && do_cap_bounding)
+        {
+          int res = prctl (PR_CAPBSET_DROP, cap, 0, 0, 0);
+          if (res == -1 && !(errno == EINVAL || errno == EPERM))
+            die_with_error ("Dropping capability %ld from bounds", cap);
+        }
     }
-
-  if (is_privileged)
-    {
-      /* Drop all non-require capabilities */
-      data[0].effective = REQUIRED_CAPS_0;
-      data[0].permitted = REQUIRED_CAPS_0;
-      data[0].inheritable = 0;
-      data[1].effective = REQUIRED_CAPS_1;
-      data[1].permitted = REQUIRED_CAPS_1;
-      data[1].inheritable = 0;
-      if (capset (&hdr, data) < 0)
-        die_with_error ("capset failed");
-    }
-  /* Else, we try unprivileged user namespaces */
-
-  /* We need the process to be dumpable, or we can't access /proc/self/uid_map */
-  if (prctl (PR_SET_DUMPABLE, 1, 0, 0, 0) < 0)
-    die_with_error ("prctl(PR_SET_DUMPABLE) failed");
 }
 
 static void
-drop_caps (void)
+drop_cap_bounding_set (bool drop_all)
 {
-  struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
-  struct __user_cap_data_struct data[2] = { { 0 } };
+  if (!drop_all)
+    prctl_caps (requested_caps, TRUE, FALSE);
+  else
+    {
+      uint32_t no_caps[2] = {0, 0};
+      prctl_caps (no_caps, TRUE, FALSE);
+    }
+}
+
+static void
+set_ambient_capabilities (void)
+{
+  if (is_privileged)
+    return;
+  prctl_caps (requested_caps, FALSE, TRUE);
+}
+
+/* This acquires the privileges that the bwrap will need it to work.
+ * If bwrap is not setuid, then this does nothing, and it relies on
+ * unprivileged user namespaces to be used. This case is
+ * "is_privileged = FALSE".
+ *
+ * If bwrap is setuid, then we do things in phases.
+ * The first part is run as euid 0, but with fsuid as the real user.
+ * The second part, inside the child, is run as the real user but with
+ * capabilities.
+ * And finally we drop all capabilities.
+ * The reason for the above dance is to avoid having the setup phase
+ * being able to read files the user can't, while at the same time
+ * working around various kernel issues. See below for details.
+ */
+static void
+acquire_privs (void)
+{
+  uid_t euid, new_fsuid;
+
+  euid = geteuid ();
+
+  /* Are we setuid ? */
+  if (real_uid != euid)
+    {
+      if (euid != 0)
+        die ("Unexpected setuid user %d, should be 0", euid);
+
+      is_privileged = TRUE;
+      /* We want to keep running as euid=0 until at the clone()
+       * operation because doing so will make the user namespace be
+       * owned by root, which makes it not ptrace:able by the user as
+       * it otherwise would be. After that we will run fully as the
+       * user, which is necessary e.g. to be able to read from a fuse
+       * mount from the user.
+       *
+       * However, we don't want to accidentally mis-use euid=0 for
+       * escalated filesystem access before the clone(), so we set
+       * fsuid to the uid.
+       */
+      if (setfsuid (real_uid) < 0)
+        die_with_error ("Unable to set fsuid");
+
+      /* setfsuid can't properly report errors, check that it worked (as per manpage) */
+      new_fsuid = setfsuid (-1);
+      if (new_fsuid != real_uid)
+        die ("Unable to set fsuid (was %d)", (int)new_fsuid);
+
+      /* We never need capabilities after execve(), so lets drop everything from the bounding set */
+      drop_cap_bounding_set (TRUE);
+
+      /* Keep only the required capabilities for setup */
+      set_required_caps ();
+    }
+  else if (real_uid != 0 && has_caps ())
+    {
+      /* We have some capabilities in the non-setuid case, which should not happen.
+         Probably caused by the binary being setcap instead of setuid which we
+         don't support anymore */
+      die ("Unexpected capabilities but not setuid, old file caps config?");
+    }
+  else if (real_uid == 0)
+    {
+      /* If our uid is 0, default to inheriting all caps; the caller
+       * can drop them via --cap-drop.  This is used by at least rpm-ostree.
+       * Note this needs to happen before the argument parsing of --cap-drop.
+       */
+      struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+      struct __user_cap_data_struct data[2] = { { 0 } };
+
+      if (capget (&hdr, data) < 0)
+        die_with_error ("capget (for uid == 0) failed");
+
+      requested_caps[0] = data[0].effective;
+      requested_caps[1] = data[1].effective;
+    }
+
+  /* Else, we try unprivileged user namespaces */
+}
+
+/* This is called once we're inside the namespace */
+static void
+switch_to_user_with_privs (void)
+{
+  /* If we're in a new user namespace, we got back the bounding set, clear it again */
+  if (opt_unshare_user || opt_userns_fd != -1)
+    drop_cap_bounding_set (FALSE);
+
+  /* If we switched to a new user namespace it may allow other uids/gids, so switch to the target one */
+  if (opt_userns_fd != -1)
+    {
+      if (opt_sandbox_uid != real_uid && setuid (opt_sandbox_uid) < 0)
+        die_with_error ("unable to switch to uid %d", opt_sandbox_uid);
+
+      if (opt_sandbox_gid != real_gid && setgid (opt_sandbox_gid) < 0)
+        die_with_error ("unable to switch to gid %d", opt_sandbox_gid);
+    }
 
   if (!is_privileged)
     return;
 
-  if (capset (&hdr, data) < 0)
-    die_with_error ("capset failed");
+  /* Tell kernel not clear capabilities when later dropping root uid */
+  if (prctl (PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
+    die_with_error ("prctl(PR_SET_KEEPCAPS) failed");
+
+  if (setuid (opt_sandbox_uid) < 0)
+    die_with_error ("unable to drop root uid");
+
+  /* Regain effective required capabilities from permitted */
+  set_required_caps ();
+}
+
+/* Call setuid() and use capset() to adjust capabilities */
+static void
+drop_privs (bool keep_requested_caps,
+            bool already_changed_uid)
+{
+  assert (!keep_requested_caps || !is_privileged);
+  /* Drop root uid */
+  if (is_privileged && !already_changed_uid &&
+      setuid (opt_sandbox_uid) < 0)
+    die_with_error ("unable to drop root uid");
+
+  drop_all_caps (keep_requested_caps);
+
+  /* We don't have any privs now, so mark us dumpable which makes /proc/self be owned by the user instead of root */
+  if (prctl (PR_SET_DUMPABLE, 1, 0, 0, 0) != 0)
+    die_with_error ("can't set dumpable");
 }
 
 static char *
@@ -427,14 +866,6 @@ get_newroot_path (const char *path)
   while (*path == '/')
     path++;
   return strconcat ("/newroot/", path);
-}
-
-static char *
-get_oldroot_path (const char *path)
-{
-  while (*path == '/')
-    path++;
-  return strconcat ("/oldroot/", path);
 }
 
 static void
@@ -450,21 +881,33 @@ write_uid_gid_map (uid_t sandbox_uid,
   cleanup_free char *gid_map = NULL;
   cleanup_free char *dir = NULL;
   cleanup_fd int dir_fd = -1;
+  uid_t old_fsuid = -1;
 
   if (pid == -1)
     dir = xstrdup ("self");
   else
     dir = xasprintf ("%d", pid);
 
-  dir_fd = openat (proc_fd, dir, O_RDONLY | O_PATH);
+  dir_fd = openat (proc_fd, dir, O_PATH);
   if (dir_fd < 0)
     die_with_error ("open /proc/%s failed", dir);
 
   if (map_root && parent_uid != 0 && sandbox_uid != 0)
-    uid_map = xasprintf ("0 0 1\n"
-                         "%d %d 1\n", sandbox_uid, parent_uid);
+    uid_map = xasprintf ("0 %d 1\n"
+                         "%d %d 1\n", overflow_uid, sandbox_uid, parent_uid);
   else
     uid_map = xasprintf ("%d %d 1\n", sandbox_uid, parent_uid);
+
+  if (map_root && parent_gid != 0 && sandbox_gid != 0)
+    gid_map = xasprintf ("0 %d 1\n"
+                         "%d %d 1\n", overflow_gid, sandbox_gid, parent_gid);
+  else
+    gid_map = xasprintf ("%d %d 1\n", sandbox_gid, parent_gid);
+
+  /* We have to be root to be allowed to write to the uid map
+   * for setuid apps, so temporary set fsuid to 0 */
+  if (is_privileged)
+    old_fsuid = setfsuid (0);
 
   if (write_file_at (dir_fd, "uid_map", uid_map) != 0)
     die_with_error ("setting up uid map");
@@ -481,29 +924,36 @@ write_uid_gid_map (uid_t sandbox_uid,
         die_with_error ("error writing to setgroups");
     }
 
-  if (map_root && parent_gid != 0 && sandbox_gid != 0)
-    gid_map = xasprintf ("0 0 1\n"
-                         "%d %d 1\n", sandbox_gid, parent_gid);
-  else
-    gid_map = xasprintf ("%d %d 1\n", sandbox_gid, parent_gid);
-
   if (write_file_at (dir_fd, "gid_map", gid_map) != 0)
     die_with_error ("setting up gid map");
+
+  if (is_privileged)
+    {
+      setfsuid (old_fsuid);
+      if (setfsuid (-1) != real_uid)
+        die ("Unable to re-set fsuid");
+    }
 }
 
 static void
 privileged_op (int         privileged_op_socket,
                uint32_t    op,
                uint32_t    flags,
+               uint32_t    perms,
                const char *arg1,
                const char *arg2)
 {
+  bind_mount_result bind_result;
+
   if (privileged_op_socket != -1)
     {
       uint32_t buffer[2048];  /* 8k, but is int32 to guarantee nice alignment */
       PrivSepOp *op_buffer = (PrivSepOp *) buffer;
       size_t buffer_size = sizeof (PrivSepOp);
       uint32_t arg1_offset = 0, arg2_offset = 0;
+
+      /* We're unprivileged, send this request to the privileged part */
+
       if (arg1 != NULL)
         {
           arg1_offset = buffer_size;
@@ -520,6 +970,7 @@ privileged_op (int         privileged_op_socket,
 
       op_buffer->op = op;
       op_buffer->flags = flags;
+      op_buffer->perms = perms;
       op_buffer->arg1_offset = arg1_offset;
       op_buffer->arg2_offset = arg2_offset;
       if (arg1 != NULL)
@@ -536,33 +987,63 @@ privileged_op (int         privileged_op_socket,
       return;
     }
 
+  /*
+   * This runs a privileged request for the unprivileged setup
+   * code. Note that since the setup code is unprivileged it is not as
+   * trusted, so we need to verify that all requests only affect the
+   * child namespace as set up by the privileged parts of the setup,
+   * and that all the code is very careful about handling input.
+   *
+   * This means:
+   *  * Bind mounts are safe, since we always use filesystem namespace. They
+   *     must be recursive though, as otherwise you can use a non-recursive bind
+   *     mount to access an otherwise over-mounted mountpoint.
+   *  * Mounting proc, tmpfs, mqueue, devpts in the child namespace is assumed to
+   *    be safe.
+   *  * Remounting RO (even non-recursive) is safe because it decreases privileges.
+   *  * sethostname() is safe only if we set up a UTS namespace
+   */
   switch (op)
     {
     case PRIV_SEP_OP_DONE:
       break;
 
+    case PRIV_SEP_OP_REMOUNT_RO_NO_RECURSIVE:
+      bind_result = bind_mount (proc_fd, NULL, arg2, BIND_READONLY);
+
+      if (bind_result != BIND_MOUNT_SUCCESS)
+        die_with_bind_result (bind_result, errno,
+                              "Can't remount readonly on %s", arg2);
+
+      break;
+
     case PRIV_SEP_OP_BIND_MOUNT:
       /* We always bind directories recursively, otherwise this would let us
          access files that are otherwise covered on the host */
-      if (bind_mount (proc_fd, arg1, arg2, BIND_RECURSIVE | flags) != 0)
-        die_with_error ("Can't bind mount %s on %s", arg1, arg2);
+      bind_result = bind_mount (proc_fd, arg1, arg2, BIND_RECURSIVE | flags);
+
+      if (bind_result != BIND_MOUNT_SUCCESS)
+        die_with_bind_result (bind_result, errno,
+                              "Can't bind mount %s on %s", arg1, arg2);
+
       break;
 
     case PRIV_SEP_OP_PROC_MOUNT:
-      if (mount ("proc", arg1, "proc", MS_MGC_VAL | MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) != 0)
+      if (mount ("proc", arg1, "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) != 0)
         die_with_error ("Can't mount proc on %s", arg1);
       break;
 
     case PRIV_SEP_OP_TMPFS_MOUNT:
       {
-        cleanup_free char *opt = label_mount ("mode=0755", opt_file_label);
-        if (mount ("tmpfs", arg1, "tmpfs", MS_MGC_VAL | MS_NOSUID | MS_NODEV, opt) != 0)
+        cleanup_free char *mode = xasprintf ("mode=%#o", perms);
+        cleanup_free char *opt = label_mount (mode, opt_file_label);
+        if (mount ("tmpfs", arg1, "tmpfs", MS_NOSUID | MS_NODEV, opt) != 0)
           die_with_error ("Can't mount tmpfs on %s", arg1);
         break;
       }
 
     case PRIV_SEP_OP_DEVPTS_MOUNT:
-      if (mount ("devpts", arg1, "devpts", MS_MGC_VAL | MS_NOSUID | MS_NOEXEC,
+      if (mount ("devpts", arg1, "devpts", MS_NOSUID | MS_NOEXEC,
                  "newinstance,ptmxmode=0666,mode=620") != 0)
         die_with_error ("Can't mount devpts on %s", arg1);
       break;
@@ -572,11 +1053,24 @@ privileged_op (int         privileged_op_socket,
         die_with_error ("Can't mount mqueue on %s", arg1);
       break;
 
+    case PRIV_SEP_OP_SET_HOSTNAME:
+      /* This is checked at the start, but lets verify it here in case
+         something manages to send hacked priv-sep operation requests. */
+      if (!opt_unshare_uts)
+        die ("Refusing to set hostname in original namespace");
+      if (sethostname (arg1, strlen(arg1)) != 0)
+        die_with_error ("Can't set hostname to %s", arg1);
+      break;
+
     default:
       die ("Unexpected privileged op %d", op);
     }
 }
 
+/* This is run unprivileged in the child namespace but can request
+ * some privileged operations (also in the child namespace) via the
+ * privileged_op_socket.
+ */
 static void
 setup_newroot (bool unshare_pid,
                int  privileged_op_socket)
@@ -596,13 +1090,32 @@ setup_newroot (bool unshare_pid,
           source = get_oldroot_path (op->source);
           source_mode = get_file_mode (source);
           if (source_mode < 0)
-            die_with_error ("Can't get type of source %s", op->source);
+            {
+              if (op->flags & ALLOW_NOTEXIST && errno == ENOENT)
+                continue; /* Ignore and move on */
+              die_with_error("Can't get type of source %s", op->source);
+            }
         }
 
-      if (op->dest)
+      if (op->dest &&
+          (op->flags & NO_CREATE_DEST) == 0)
         {
+          unsigned parent_mode = 0755;
+
+          /* If we're creating a file that is inaccessible by the owning group,
+           * try to achieve least-astonishment by creating parents also
+           * inaccessible by that group. */
+          if (op->perms >= 0 &&
+              (op->perms & 0070) == 0)
+            parent_mode &= ~0050;
+
+          /* The same, but for users other than the owner and group. */
+          if (op->perms >= 0 &&
+              (op->perms & 0007) == 0)
+            parent_mode &= ~0005;
+
           dest = get_newroot_path (op->dest);
-          if (mkdir_with_parents (dest, 0755, FALSE) != 0)
+          if (mkdir_with_parents (dest, parent_mode, FALSE) != 0)
             die_with_error ("Can't mkdir parents for %s", op->dest);
         }
 
@@ -613,35 +1126,40 @@ setup_newroot (bool unshare_pid,
         case SETUP_BIND_MOUNT:
           if (source_mode == S_IFDIR)
             {
-              if (mkdir (dest, 0755) != 0 && errno != EEXIST)
+              if (ensure_dir (dest, 0755) != 0)
                 die_with_error ("Can't mkdir %s", op->dest);
             }
-          else if (ensure_file (dest, 0666) != 0)
+          else if (ensure_file (dest, 0444) != 0)
             die_with_error ("Can't create file at %s", op->dest);
 
           privileged_op (privileged_op_socket,
                          PRIV_SEP_OP_BIND_MOUNT,
                          (op->type == SETUP_RO_BIND_MOUNT ? BIND_READONLY : 0) |
                          (op->type == SETUP_DEV_BIND_MOUNT ? BIND_DEVICES : 0),
-                         source, dest);
+                         0, source, dest);
+          break;
+
+        case SETUP_REMOUNT_RO_NO_RECURSIVE:
+          privileged_op (privileged_op_socket,
+                         PRIV_SEP_OP_REMOUNT_RO_NO_RECURSIVE, 0, 0, NULL, dest);
           break;
 
         case SETUP_MOUNT_PROC:
-          if (mkdir (dest, 0755) != 0 && errno != EEXIST)
+          if (ensure_dir (dest, 0755) != 0)
             die_with_error ("Can't mkdir %s", op->dest);
 
-          if (unshare_pid)
+          if (unshare_pid || opt_pidns_fd != -1)
             {
               /* Our own procfs */
               privileged_op (privileged_op_socket,
-                             PRIV_SEP_OP_PROC_MOUNT, 0,
+                             PRIV_SEP_OP_PROC_MOUNT, 0, 0,
                              dest, NULL);
             }
           else
             {
               /* Use system procfs, as we share pid namespace anyway */
               privileged_op (privileged_op_socket,
-                             PRIV_SEP_OP_BIND_MOUNT, 0,
+                             PRIV_SEP_OP_BIND_MOUNT, 0, 0,
                              "oldroot/proc", dest);
             }
 
@@ -653,19 +1171,28 @@ setup_newroot (bool unshare_pid,
           for (i = 0; i < N_ELEMENTS (cover_proc_dirs); i++)
             {
               cleanup_free char *subdir = strconcat3 (dest, "/", cover_proc_dirs[i]);
+              if (access (subdir, W_OK) < 0)
+                {
+                  /* The file is already read-only or doesn't exist.  */
+                  if (errno == EACCES || errno == ENOENT || errno == EROFS)
+                    continue;
+
+                  die_with_error ("Can't access %s", subdir);
+                }
+
               privileged_op (privileged_op_socket,
-                             PRIV_SEP_OP_BIND_MOUNT, BIND_READONLY,
+                             PRIV_SEP_OP_BIND_MOUNT, BIND_READONLY, 0,
                              subdir, subdir);
             }
 
           break;
 
         case SETUP_MOUNT_DEV:
-          if (mkdir (dest, 0755) != 0 && errno != EEXIST)
+          if (ensure_dir (dest, 0755) != 0)
             die_with_error ("Can't mkdir %s", op->dest);
 
           privileged_op (privileged_op_socket,
-                         PRIV_SEP_OP_TMPFS_MOUNT, 0,
+                         PRIV_SEP_OP_TMPFS_MOUNT, 0, 0755,
                          dest, NULL);
 
           static const char *const devnodes[] = { "null", "zero", "full", "random", "urandom", "tty" };
@@ -673,10 +1200,10 @@ setup_newroot (bool unshare_pid,
             {
               cleanup_free char *node_dest = strconcat3 (dest, "/", devnodes[i]);
               cleanup_free char *node_src = strconcat ("/oldroot/dev/", devnodes[i]);
-              if (create_file (node_dest, 0666, NULL) != 0)
+              if (create_file (node_dest, 0444, NULL) != 0)
                 die_with_error ("Can't create file %s/%s", op->dest, devnodes[i]);
               privileged_op (privileged_op_socket,
-                             PRIV_SEP_OP_BIND_MOUNT, BIND_DEVICES,
+                             PRIV_SEP_OP_BIND_MOUNT, BIND_DEVICES, 0,
                              node_src, node_dest);
             }
 
@@ -689,6 +1216,16 @@ setup_newroot (bool unshare_pid,
                 die_with_error ("Can't create symlink %s/%s", op->dest, stdionodes[i]);
             }
 
+          /* /dev/fd and /dev/core - legacy, but both nspawn and docker do these */
+          { cleanup_free char *dev_fd = strconcat (dest, "/fd");
+            if (symlink ("/proc/self/fd", dev_fd) < 0)
+              die_with_error ("Can't create symlink %s", dev_fd);
+          }
+          { cleanup_free char *dev_core = strconcat (dest, "/core");
+            if (symlink ("/proc/kcore", dev_core) < 0)
+              die_with_error ("Can't create symlink %s", dev_core);
+          }
+
           {
             cleanup_free char *pts = strconcat (dest, "/pts");
             cleanup_free char *ptmx = strconcat (dest, "/ptmx");
@@ -700,8 +1237,7 @@ setup_newroot (bool unshare_pid,
             if (mkdir (pts, 0755) == -1)
               die_with_error ("Can't create %s/devpts", op->dest);
             privileged_op (privileged_op_socket,
-                           PRIV_SEP_OP_DEVPTS_MOUNT, BIND_DEVICES,
-                           pts, NULL);
+                           PRIV_SEP_OP_DEVPTS_MOUNT, 0, 0, pts, NULL);
 
             if (symlink ("pts/ptmx", ptmx) != 0)
               die_with_error ("Can't make symlink at %s/ptmx", op->dest);
@@ -717,37 +1253,60 @@ setup_newroot (bool unshare_pid,
               cleanup_free char *src_tty_dev = strconcat ("/oldroot", host_tty_dev);
               cleanup_free char *dest_console = strconcat (dest, "/console");
 
-              if (create_file (dest_console, 0666, NULL) != 0)
+              if (create_file (dest_console, 0444, NULL) != 0)
                 die_with_error ("creating %s/console", op->dest);
 
               privileged_op (privileged_op_socket,
-                             PRIV_SEP_OP_BIND_MOUNT, BIND_DEVICES,
+                             PRIV_SEP_OP_BIND_MOUNT, BIND_DEVICES, 0,
                              src_tty_dev, dest_console);
             }
 
           break;
 
         case SETUP_MOUNT_TMPFS:
-          if (mkdir (dest, 0755) != 0 && errno != EEXIST)
+          assert (dest != NULL);
+          assert (op->perms >= 0);
+          assert (op->perms <= 07777);
+
+          if (ensure_dir (dest, 0755) != 0)
             die_with_error ("Can't mkdir %s", op->dest);
 
           privileged_op (privileged_op_socket,
-                         PRIV_SEP_OP_TMPFS_MOUNT, 0,
+                         PRIV_SEP_OP_TMPFS_MOUNT, 0, op->perms,
                          dest, NULL);
           break;
 
         case SETUP_MOUNT_MQUEUE:
-          if (mkdir (dest, 0755) != 0 && errno != EEXIST)
+          if (ensure_dir (dest, 0755) != 0)
             die_with_error ("Can't mkdir %s", op->dest);
 
           privileged_op (privileged_op_socket,
-                         PRIV_SEP_OP_MQUEUE_MOUNT, 0,
+                         PRIV_SEP_OP_MQUEUE_MOUNT, 0, 0,
                          dest, NULL);
           break;
 
         case SETUP_MAKE_DIR:
-          if (mkdir (dest, 0755) != 0 && errno != EEXIST)
+          assert (dest != NULL);
+          assert (op->perms >= 0);
+          assert (op->perms <= 07777);
+
+          if (ensure_dir (dest, op->perms) != 0)
             die_with_error ("Can't mkdir %s", op->dest);
+
+          break;
+
+        case SETUP_CHMOD:
+          assert (op->dest != NULL);
+          /* We used NO_CREATE_DEST so we have to use get_newroot_path()
+           * explicitly */
+          assert (dest == NULL);
+          dest = get_newroot_path (op->dest);
+          assert (dest != NULL);
+          assert (op->perms >= 0);
+          assert (op->perms <= 07777);
+
+          if (chmod (dest, op->perms) != 0)
+            die_with_error ("Can't chmod %#o %s", op->perms, op->dest);
 
           break;
 
@@ -755,7 +1314,11 @@ setup_newroot (bool unshare_pid,
           {
             cleanup_fd int dest_fd = -1;
 
-            dest_fd = creat (dest, 0666);
+            assert (dest != NULL);
+            assert (op->perms >= 0);
+            assert (op->perms <= 07777);
+
+            dest_fd = creat (dest, op->perms);
             if (dest_fd == -1)
               die_with_error ("Can't create file %s", op->dest);
 
@@ -763,35 +1326,62 @@ setup_newroot (bool unshare_pid,
               die_with_error ("Can't write data to file %s", op->dest);
 
             close (op->fd);
+            op->fd = -1;
           }
           break;
 
         case SETUP_MAKE_BIND_FILE:
+        case SETUP_MAKE_RO_BIND_FILE:
           {
             cleanup_fd int dest_fd = -1;
             char tempfile[] = "/bindfileXXXXXX";
+
+            assert (dest != NULL);
+            assert (op->perms >= 0);
+            assert (op->perms <= 07777);
 
             dest_fd = mkstemp (tempfile);
             if (dest_fd == -1)
               die_with_error ("Can't create tmpfile for %s", op->dest);
 
+            if (fchmod (dest_fd, op->perms) != 0)
+              die_with_error ("Can't set mode %#o on file to be used for %s",
+                              op->perms, op->dest);
+
             if (copy_file_data (op->fd, dest_fd) != 0)
               die_with_error ("Can't write data to file %s", op->dest);
 
             close (op->fd);
+            op->fd = -1;
 
-            if (ensure_file (dest, 0666) != 0)
+            assert (dest != NULL);
+
+            if (ensure_file (dest, 0444) != 0)
               die_with_error ("Can't create file at %s", op->dest);
 
             privileged_op (privileged_op_socket,
                            PRIV_SEP_OP_BIND_MOUNT,
+                           (op->type == SETUP_MAKE_RO_BIND_FILE ? BIND_READONLY : 0),
                            0, tempfile, dest);
+
+            /* Remove the file so we're sure the app can't get to it in any other way.
+               Its outside the container chroot, so it shouldn't be possible, but lets
+               make it really sure. */
+            unlink (tempfile);
           }
           break;
 
         case SETUP_MAKE_SYMLINK:
+          assert (op->source != NULL);  /* guaranteed by the constructor */
           if (symlink (op->source, dest) != 0)
             die_with_error ("Can't make symlink at %s", op->dest);
+          break;
+
+        case SETUP_SET_HOSTNAME:
+          assert (op->dest != NULL);  /* guaranteed by the constructor */
+          privileged_op (privileged_op_socket,
+                         PRIV_SEP_OP_SET_HOSTNAME, 0, 0,
+                         op->dest, NULL);
           break;
 
         default:
@@ -799,8 +1389,72 @@ setup_newroot (bool unshare_pid,
         }
     }
   privileged_op (privileged_op_socket,
-                 PRIV_SEP_OP_DONE, 0, NULL, NULL);
+                 PRIV_SEP_OP_DONE, 0, 0, NULL, NULL);
 }
+
+/* Do not leak file descriptors already used by setup_newroot () */
+static void
+close_ops_fd (void)
+{
+  SetupOp *op;
+
+  for (op = ops; op != NULL; op = op->next)
+    {
+      if (op->fd != -1)
+        {
+          (void) close (op->fd);
+          op->fd = -1;
+        }
+    }
+}
+
+/* We need to resolve relative symlinks in the sandbox before we
+   chroot so that absolute symlinks are handled correctly. We also
+   need to do this after we've switched to the real uid so that
+   e.g. paths on fuse mounts work */
+static void
+resolve_symlinks_in_ops (void)
+{
+  SetupOp *op;
+
+  for (op = ops; op != NULL; op = op->next)
+    {
+      const char *old_source;
+
+      switch (op->type)
+        {
+        case SETUP_RO_BIND_MOUNT:
+        case SETUP_DEV_BIND_MOUNT:
+        case SETUP_BIND_MOUNT:
+          old_source = op->source;
+          op->source = realpath (old_source, NULL);
+          if (op->source == NULL)
+            {
+              if (op->flags & ALLOW_NOTEXIST && errno == ENOENT)
+                op->source = old_source;
+              else
+                die_with_error("Can't find source path %s", old_source);
+            }
+          break;
+
+        case SETUP_MOUNT_PROC:
+        case SETUP_MOUNT_DEV:
+        case SETUP_MOUNT_TMPFS:
+        case SETUP_MOUNT_MQUEUE:
+        case SETUP_MAKE_DIR:
+        case SETUP_MAKE_FILE:
+        case SETUP_MAKE_BIND_FILE:
+        case SETUP_MAKE_RO_BIND_FILE:
+        case SETUP_MAKE_SYMLINK:
+        case SETUP_REMOUNT_RO_NO_RECURSIVE:
+        case SETUP_SET_HOSTNAME:
+        case SETUP_CHMOD:
+        default:
+          break;
+        }
+    }
+}
+
 
 static const char *
 resolve_string_offset (void    *buffer,
@@ -821,6 +1475,7 @@ read_priv_sec_op (int          read_socket,
                   void        *buffer,
                   size_t       buffer_size,
                   uint32_t    *flags,
+                  uint32_t    *perms,
                   const char **arg1,
                   const char **arg2)
 {
@@ -834,6 +1489,9 @@ read_priv_sec_op (int          read_socket,
   if (rec_len < 0)
     die_with_error ("Can't read from unprivileged helper");
 
+  if (rec_len == 0)
+    exit (1); /* Privileged helper died and printed error, so exit silently */
+
   if (rec_len < sizeof (PrivSepOp))
     die ("Invalid size %zd from unprivileged helper", rec_len);
 
@@ -841,37 +1499,51 @@ read_priv_sec_op (int          read_socket,
   ((char *) buffer)[rec_len] = 0;
 
   *flags = op->flags;
+  *perms = op->perms;
   *arg1 = resolve_string_offset (buffer, rec_len, op->arg1_offset);
   *arg2 = resolve_string_offset (buffer, rec_len, op->arg2_offset);
 
   return op->op;
 }
 
-char *opt_chdir_path = NULL;
-bool opt_unshare_user = FALSE;
-bool opt_unshare_user_try = FALSE;
-bool opt_unshare_pid = FALSE;
-bool opt_unshare_ipc = FALSE;
-bool opt_unshare_net = FALSE;
-bool opt_unshare_uts = FALSE;
-bool opt_unshare_cgroup = FALSE;
-bool opt_unshare_cgroup_try = FALSE;
-bool opt_needs_devpts = FALSE;
-uid_t opt_sandbox_uid = -1;
-gid_t opt_sandbox_gid = -1;
-int opt_sync_fd = -1;
-int opt_seccomp_fd = -1;
+static void __attribute__ ((noreturn))
+print_version_and_exit (void)
+{
+  printf ("%s\n", PACKAGE_STRING);
+  exit (0);
+}
 
+static int
+takes_perms (const char *next_option)
+{
+  static const char *const options_that_take_perms[] =
+  {
+    "--bind-data",
+    "--dir",
+    "--file",
+    "--ro-bind-data",
+    "--tmpfs",
+  };
+  size_t i;
+
+  for (i = 0; i < N_ELEMENTS (options_that_take_perms); i++)
+    {
+      if (strcmp (options_that_take_perms[i], next_option) == 0)
+        return 1;
+    }
+
+  return 0;
+}
 
 static void
-parse_args_recurse (int    *argcp,
-                    char ***argvp,
-                    bool    in_file,
-                    int    *total_parsed_argc_p)
+parse_args_recurse (int          *argcp,
+                    const char ***argvp,
+                    bool          in_file,
+                    int          *total_parsed_argc_p)
 {
   SetupOp *op;
   int argc = *argcp;
-  char **argv = *argvp;
+  const char **argv = *argvp;
   /* I can't imagine a case where someone wants more than this.
    * If you do...you should be able to pass multiple files
    * via a single tmpfs and linking them there, etc.
@@ -891,24 +1563,25 @@ parse_args_recurse (int    *argcp,
     {
       const char *arg = argv[0];
 
+      if (next_perms >= 0 && !takes_perms (arg))
+        die ("--perms must be followed by an option that creates a file");
+
       if (strcmp (arg, "--help") == 0)
         {
           usage (EXIT_SUCCESS, stdout);
         }
       else if (strcmp (arg, "--version") == 0)
         {
-          printf ("%s\n", PACKAGE_STRING);
-          exit (0);
+          print_version_and_exit ();
         }
       else if (strcmp (arg, "--args") == 0)
         {
           int the_fd;
           char *endptr;
-          char *data, *p;
-          char *data_end;
+          const char *p, *data_end;
           size_t data_len;
-          cleanup_free char **data_argv = NULL;
-          char **data_argv_copy;
+          cleanup_free const char **data_argv = NULL;
+          const char **data_argv_copy;
           int data_argc;
           int i;
 
@@ -922,14 +1595,18 @@ parse_args_recurse (int    *argcp,
           if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
             die ("Invalid fd: %s", argv[1]);
 
-          data = load_file_data (the_fd, &data_len);
-          if (data == NULL)
+          /* opt_args_data is essentially a recursive argv array, which we must
+           * keep allocated until exit time, since its argv entries get used
+           * by the other cases in parse_args_recurse() when we recurse. */
+          opt_args_data = load_file_data (the_fd, &data_len);
+          if (opt_args_data == NULL)
             die_with_error ("Can't read --args data");
+          (void) close (the_fd);
 
-          data_end = data + data_len;
+          data_end = opt_args_data + data_len;
           data_argc = 0;
 
-          p = data;
+          p = opt_args_data;
           while (p != NULL && p < data_end)
             {
               data_argc++;
@@ -944,7 +1621,7 @@ parse_args_recurse (int    *argcp,
           data_argv = xcalloc (sizeof (char *) * (data_argc + 1));
 
           i = 0;
-          p = data;
+          p = opt_args_data;
           while (p != NULL && p < data_end)
             {
               /* Note: load_file_data always adds a nul terminator, so this is safe
@@ -961,6 +1638,17 @@ parse_args_recurse (int    *argcp,
           argv += 1;
           argc -= 1;
         }
+      else if (strcmp (arg, "--unshare-all") == 0)
+        {
+          /* Keep this in order with the older (legacy) --unshare arguments,
+           * we use the --try variants of user and cgroup, since we want
+           * to support systems/kernels without support for those.
+           */
+          opt_unshare_user_try = opt_unshare_ipc = opt_unshare_pid =
+            opt_unshare_uts = opt_unshare_cgroup_try =
+            opt_unshare_net = TRUE;
+        }
+      /* Begin here the older individual --unshare variants */
       else if (strcmp (arg, "--unshare-user") == 0)
         {
           opt_unshare_user = TRUE;
@@ -993,6 +1681,12 @@ parse_args_recurse (int    *argcp,
         {
           opt_unshare_cgroup_try = TRUE;
         }
+      /* Begin here the newer --share variants */
+      else if (strcmp (arg, "--share-net") == 0)
+        {
+          opt_unshare_net = FALSE;
+        }
+      /* End --share variants, other arguments begin */
       else if (strcmp (arg, "--chdir") == 0)
         {
           if (argc < 2)
@@ -1002,44 +1696,58 @@ parse_args_recurse (int    *argcp,
           argv++;
           argc--;
         }
-      else if (strcmp (arg, "--bind") == 0)
+      else if (strcmp (arg, "--remount-ro") == 0)
+        {
+          if (argc < 2)
+            die ("--remount-ro takes one argument");
+
+          op = setup_op_new (SETUP_REMOUNT_RO_NO_RECURSIVE);
+          op->dest = argv[1];
+
+          argv++;
+          argc--;
+        }
+      else if (strcmp(arg, "--bind") == 0 ||
+               strcmp(arg, "--bind-try") == 0)
         {
           if (argc < 3)
-            die ("--bind takes two arguments");
+            die ("%s takes two arguments", arg);
 
           op = setup_op_new (SETUP_BIND_MOUNT);
-          op->source = canonicalize_file_name (argv[1]);
-          if (op->source == NULL)
-            die_with_error ("Can't find source path %s", argv[1]);
+          op->source = argv[1];
           op->dest = argv[2];
+          if (strcmp(arg, "--bind-try") == 0)
+            op->flags = ALLOW_NOTEXIST;
 
           argv += 2;
           argc -= 2;
         }
-      else if (strcmp (arg, "--ro-bind") == 0)
+      else if (strcmp(arg, "--ro-bind") == 0 ||
+               strcmp(arg, "--ro-bind-try") == 0)
         {
           if (argc < 3)
-            die ("--ro-bind takes two arguments");
+            die ("%s takes two arguments", arg);
 
           op = setup_op_new (SETUP_RO_BIND_MOUNT);
-          op->source = canonicalize_file_name (argv[1]);
-          if (op->source == NULL)
-            die_with_error ("Can't find source path %s", argv[1]);
+          op->source = argv[1];
           op->dest = argv[2];
+          if (strcmp(arg, "--ro-bind-try") == 0)
+            op->flags = ALLOW_NOTEXIST;
 
           argv += 2;
           argc -= 2;
         }
-      else if (strcmp (arg, "--dev-bind") == 0)
+      else if (strcmp (arg, "--dev-bind") == 0 ||
+               strcmp (arg, "--dev-bind-try") == 0)
         {
           if (argc < 3)
-            die ("--dev-bind takes two arguments");
+            die ("%s takes two arguments", arg);
 
           op = setup_op_new (SETUP_DEV_BIND_MOUNT);
-          op->source = canonicalize_file_name (argv[1]);
-          if (op->source == NULL)
-            die_with_error ("Can't find source path %s", argv[1]);
+          op->source = argv[1];
           op->dest = argv[2];
+          if (strcmp(arg, "--dev-bind-try") == 0)
+            op->flags = ALLOW_NOTEXIST;
 
           argv += 2;
           argc -= 2;
@@ -1097,6 +1805,13 @@ parse_args_recurse (int    *argcp,
           op = setup_op_new (SETUP_MOUNT_TMPFS);
           op->dest = argv[1];
 
+          /* We historically hard-coded the mode of a tmpfs as 0755. */
+          if (next_perms >= 0)
+            op->perms = next_perms;
+          else
+            op->perms = 0755;
+
+          next_perms = -1;
           argv += 1;
           argc -= 1;
         }
@@ -1119,6 +1834,13 @@ parse_args_recurse (int    *argcp,
           op = setup_op_new (SETUP_MAKE_DIR);
           op->dest = argv[1];
 
+          /* We historically hard-coded the mode of a --dir as 0755. */
+          if (next_perms >= 0)
+            op->perms = next_perms;
+          else
+            op->perms = 0755;
+
+          next_perms = -1;
           argv += 1;
           argc -= 1;
         }
@@ -1138,6 +1860,13 @@ parse_args_recurse (int    *argcp,
           op->fd = file_fd;
           op->dest = argv[2];
 
+          /* We historically hard-coded the mode of a --file as 0666. */
+          if (next_perms >= 0)
+            op->perms = next_perms;
+          else
+            op->perms = 0666;
+
+          next_perms = -1;
           argv += 2;
           argc -= 2;
         }
@@ -1157,6 +1886,43 @@ parse_args_recurse (int    *argcp,
           op->fd = file_fd;
           op->dest = argv[2];
 
+          /* This is consistent with previous bubblewrap behaviour:
+           * before implementing --perms, we took the permissions
+           * given to us by mkstemp(), which are documented to be 0600. */
+          if (next_perms >= 0)
+            op->perms = next_perms;
+          else
+            op->perms = 0600;
+
+          next_perms = -1;
+          argv += 2;
+          argc -= 2;
+        }
+      else if (strcmp (arg, "--ro-bind-data") == 0)
+        {
+          int file_fd;
+          char *endptr;
+
+          if (argc < 3)
+            die ("--ro-bind-data takes two arguments");
+
+          file_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || file_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          op = setup_op_new (SETUP_MAKE_RO_BIND_FILE);
+          op->fd = file_fd;
+          op->dest = argv[2];
+
+          /* This is consistent with previous bubblewrap behaviour:
+           * before implementing --perms, we took the permissions
+           * given to us by mkstemp(), which are documented to be 0600. */
+          if (next_perms >= 0)
+            op->perms = next_perms;
+          else
+            op->perms = 0600;
+
+          next_perms = -1;
           argv += 2;
           argc -= 2;
         }
@@ -1199,6 +1965,74 @@ parse_args_recurse (int    *argcp,
           argv += 1;
           argc -= 1;
         }
+      else if (strcmp (arg, "--block-fd") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--block-fd takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_block_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--userns-block-fd") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--userns-block-fd takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_userns_block_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--info-fd") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--info-fd takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_info_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--json-status-fd") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--json-status-fd takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_json_status_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
       else if (strcmp (arg, "--seccomp") == 0)
         {
           int the_fd;
@@ -1215,6 +2049,61 @@ parse_args_recurse (int    *argcp,
 
           argv += 1;
           argc -= 1;
+        }
+      else if (strcmp (arg, "--userns") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--userns takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_userns_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--userns2") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--userns2 takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_userns2_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--pidns") == 0)
+        {
+          int the_fd;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--pidns takes an argument");
+
+          the_fd = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_fd < 0)
+            die ("Invalid fd: %s", argv[1]);
+
+          opt_pidns_fd = the_fd;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--clearenv") == 0)
+        {
+          xclearenv ();
         }
       else if (strcmp (arg, "--setenv") == 0)
         {
@@ -1270,6 +2159,135 @@ parse_args_recurse (int    *argcp,
           argv += 1;
           argc -= 1;
         }
+      else if (strcmp (arg, "--hostname") == 0)
+        {
+          if (argc < 2)
+            die ("--hostname takes an argument");
+
+          op = setup_op_new (SETUP_SET_HOSTNAME);
+          op->dest = argv[1];
+          op->flags = NO_CREATE_DEST;
+
+          opt_sandbox_hostname = argv[1];
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--new-session") == 0)
+        {
+          opt_new_session = TRUE;
+        }
+      else if (strcmp (arg, "--die-with-parent") == 0)
+        {
+          opt_die_with_parent = TRUE;
+        }
+      else if (strcmp (arg, "--as-pid-1") == 0)
+        {
+          opt_as_pid_1 = TRUE;
+        }
+      else if (strcmp (arg, "--cap-add") == 0)
+        {
+          cap_value_t cap;
+          if (argc < 2)
+            die ("--cap-add takes an argument");
+
+          opt_cap_add_or_drop_used = TRUE;
+
+          if (strcasecmp (argv[1], "ALL") == 0)
+            {
+              requested_caps[0] = requested_caps[1] = 0xFFFFFFFF;
+            }
+          else
+            {
+              if (cap_from_name (argv[1], &cap) < 0)
+                die ("unknown cap: %s", argv[1]);
+
+              if (cap < 32)
+                requested_caps[0] |= CAP_TO_MASK_0 (cap);
+              else
+                requested_caps[1] |= CAP_TO_MASK_1 (cap - 32);
+            }
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--cap-drop") == 0)
+        {
+          cap_value_t cap;
+          if (argc < 2)
+            die ("--cap-drop takes an argument");
+
+          opt_cap_add_or_drop_used = TRUE;
+
+          if (strcasecmp (argv[1], "ALL") == 0)
+            {
+              requested_caps[0] = requested_caps[1] = 0;
+            }
+          else
+            {
+              if (cap_from_name (argv[1], &cap) < 0)
+                die ("unknown cap: %s", argv[1]);
+
+              if (cap < 32)
+                requested_caps[0] &= ~CAP_TO_MASK_0 (cap);
+              else
+                requested_caps[1] &= ~CAP_TO_MASK_1 (cap - 32);
+            }
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--perms") == 0)
+        {
+          unsigned long perms;
+          char *endptr = NULL;
+
+          if (argc < 2)
+            die ("--perms takes an argument");
+
+          perms = strtoul (argv[1], &endptr, 8);
+
+          if (argv[1][0] == '\0'
+              || endptr == NULL
+              || *endptr != '\0'
+              || perms > 07777)
+            die ("--perms takes an octal argument <= 07777");
+
+          next_perms = (int) perms;
+
+          argv += 1;
+          argc -= 1;
+        }
+      else if (strcmp (arg, "--chmod") == 0)
+        {
+          unsigned long perms;
+          char *endptr = NULL;
+
+          if (argc < 3)
+            die ("--chmod takes two arguments");
+
+          perms = strtoul (argv[1], &endptr, 8);
+
+          if (argv[1][0] == '\0'
+              || endptr == NULL
+              || *endptr != '\0'
+              || perms > 07777)
+            die ("--chmod takes an octal argument <= 07777");
+
+          op = setup_op_new (SETUP_CHMOD);
+          op->flags = NO_CREATE_DEST;
+          op->perms = (int) perms;
+          op->dest = argv[2];
+
+          argv += 2;
+          argc -= 2;
+        }
+      else if (strcmp (arg, "--") == 0)
+        {
+          argv += 1;
+          argc -= 1;
+          break;
+        }
       else if (*arg == '-')
         {
           die ("Unknown option %s", arg);
@@ -1288,12 +2306,94 @@ parse_args_recurse (int    *argcp,
 }
 
 static void
-parse_args (int    *argcp,
-            char ***argvp)
+parse_args (int          *argcp,
+            const char ***argvp)
 {
   int total_parsed_argc = *argcp;
 
   parse_args_recurse (argcp, argvp, FALSE, &total_parsed_argc);
+}
+
+static void
+read_overflowids (void)
+{
+  cleanup_free char *uid_data = NULL;
+  cleanup_free char *gid_data = NULL;
+
+  uid_data = load_file_at (AT_FDCWD, "/proc/sys/kernel/overflowuid");
+  if (uid_data == NULL)
+    die_with_error ("Can't read /proc/sys/kernel/overflowuid");
+
+  overflow_uid = strtol (uid_data, NULL, 10);
+  if (overflow_uid == 0)
+    die ("Can't parse /proc/sys/kernel/overflowuid");
+
+  gid_data = load_file_at (AT_FDCWD, "/proc/sys/kernel/overflowgid");
+  if (gid_data == NULL)
+    die_with_error ("Can't read /proc/sys/kernel/overflowgid");
+
+  overflow_gid = strtol (gid_data, NULL, 10);
+  if (overflow_gid == 0)
+    die ("Can't parse /proc/sys/kernel/overflowgid");
+}
+
+static void
+namespace_ids_read (pid_t  pid)
+{
+  cleanup_free char *dir = NULL;
+  cleanup_fd int ns_fd = -1;
+  NsInfo *info;
+
+  dir = xasprintf ("%d/ns", pid);
+  ns_fd = openat (proc_fd, dir, O_PATH);
+
+  if (ns_fd < 0)
+    die_with_error ("open /proc/%s/ns failed", dir);
+
+  for (info = ns_infos; info->name; info++)
+    {
+      bool *do_unshare = info->do_unshare;
+      struct stat st;
+      int r;
+
+      /* if we don't unshare this ns, ignore it */
+      if (do_unshare && *do_unshare == FALSE)
+        continue;
+
+      r = fstatat (ns_fd, info->name, &st, 0);
+
+      /* if we can't get the information, ignore it */
+      if (r != 0)
+        continue;
+
+      info->id = st.st_ino;
+    }
+}
+
+static void
+namespace_ids_write (int    fd,
+                     bool   in_json)
+{
+  NsInfo *info;
+
+  for (info = ns_infos; info->name; info++)
+    {
+      cleanup_free char *output = NULL;
+      const char *indent;
+      uintmax_t nsid;
+
+      nsid = (uintmax_t) info->id;
+
+      /* if we don't have the information, we don't write it */
+      if (nsid == 0)
+        continue;
+
+      indent = in_json ? " " : "\n    ";
+      output = xasprintf (",%s\"%s-namespace\": %ju",
+                          indent, info->name, nsid);
+
+      dump_info (fd, output, TRUE);
+    }
 }
 
 int
@@ -1301,28 +2401,47 @@ main (int    argc,
       char **argv)
 {
   mode_t old_umask;
-  cleanup_free char *base_path = NULL;
+  const char *base_path = NULL;
   int clone_flags;
   char *old_cwd = NULL;
   pid_t pid;
   int event_fd = -1;
   int child_wait_fd = -1;
+  int setup_finished_pipe[] = {-1, -1};
   const char *new_cwd;
   uid_t ns_uid;
   gid_t ns_gid;
   struct stat sbuf;
   uint64_t val;
   int res UNUSED;
+  cleanup_free char *seccomp_data = NULL;
+  size_t seccomp_len;
+  struct sock_fprog seccomp_prog;
+  cleanup_free char *args_data = NULL;
+  int intermediate_pids_sockets[2] = {-1, -1};
 
-  /* Get the (optional) capabilities we need, drop root */
-  acquire_caps ();
+  /* Handle --version early on before we try to acquire/drop
+   * any capabilities so it works in a build environment;
+   * right now flatpak's build runs bubblewrap --version.
+   * https://github.com/projectatomic/bubblewrap/issues/185
+   */
+  if (argc == 2 && (strcmp (argv[1], "--version") == 0))
+    print_version_and_exit ();
+
+  real_uid = getuid ();
+  real_gid = getgid ();
+
+  /* Get the (optional) privileges we need */
+  acquire_privs ();
 
   /* Never gain any more privs during exec */
   if (prctl (PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-    die_with_error ("prctl(PR_SET_NO_NEW_CAPS) failed");
+    die_with_error ("prctl(PR_SET_NO_NEW_PRIVS) failed");
 
   /* The initial code is run with high permissions
      (i.e. CAP_SYS_ADMIN), so take lots of care. */
+
+  read_overflowids ();
 
   argv0 = argv[0];
 
@@ -1335,11 +2454,55 @@ main (int    argc,
   if (argc == 0)
     usage (EXIT_FAILURE, stderr);
 
-  parse_args (&argc, &argv);
+  parse_args (&argc, (const char ***) &argv);
 
-  /* We have to do this if we weren't installed setuid, so let's just DWIM */
-  if (!is_privileged)
+  /* suck the args into a cleanup_free variable to control their lifecycle */
+  args_data = opt_args_data;
+  opt_args_data = NULL;
+
+  if ((requested_caps[0] || requested_caps[1]) && is_privileged)
+    die ("--cap-add in setuid mode can be used only by root");
+
+  if (opt_userns_block_fd != -1 && !opt_unshare_user)
+    die ("--userns-block-fd requires --unshare-user");
+
+  if (opt_userns_block_fd != -1 && opt_info_fd == -1)
+    die ("--userns-block-fd requires --info-fd");
+
+  if (opt_userns_fd != -1 && opt_unshare_user)
+    die ("--userns not compatible --unshare-user");
+
+  if (opt_userns_fd != -1 && opt_unshare_user_try)
+    die ("--userns not compatible --unshare-user-try");
+
+  /* Technically using setns() is probably safe even in the privileged
+   * case, because we got passed in a file descriptor to the
+   * namespace, and that can only be gotten if you have ptrace
+   * permissions against the target, and then you could do whatever to
+   * the namespace anyway.
+   *
+   * However, for practical reasons this isn't possible to use,
+   * because (as described in acquire_privs()) setuid bwrap causes
+   * root to own the namespaces that it creates, so you will not be
+   * able to access these namespaces anyway. So, best just not support
+   * it anway.
+   */
+  if (opt_userns_fd != -1 && is_privileged)
+    die ("--userns doesn't work in setuid mode");
+
+  if (opt_userns2_fd != -1 && is_privileged)
+    die ("--userns2 doesn't work in setuid mode");
+
+  /* We have to do this if we weren't installed setuid (and we're not
+   * root), so let's just DWIM */
+  if (!is_privileged && getuid () != 0 && opt_userns_fd == -1)
     opt_unshare_user = TRUE;
+
+#ifdef ENABLE_REQUIRE_USERNS
+  /* In this build option, we require userns. */
+  if (is_privileged && getuid () != 0 && opt_userns_fd == -1)
+    opt_unshare_user = TRUE;
+#endif
 
   if (opt_unshare_user_try &&
       stat ("/proc/self/ns/user", &sbuf) == 0)
@@ -1352,6 +2515,15 @@ main (int    argc,
           cleanup_free char *enable = NULL;
           enable = load_file_at (AT_FDCWD, "/sys/module/user_namespace/parameters/enable");
           if (enable != NULL && enable[0] == 'N')
+            disabled = TRUE;
+        }
+
+      /* Check for max_user_namespaces */
+      if (stat ("/proc/sys/user/max_user_namespaces", &sbuf) == 0)
+        {
+          cleanup_free char *max_user_ns = NULL;
+          max_user_ns = load_file_at (AT_FDCWD, "/proc/sys/user/max_user_namespaces");
+          if (max_user_ns != NULL && strcmp(max_user_ns, "0\n") == 0)
             disabled = TRUE;
         }
 
@@ -1368,39 +2540,43 @@ main (int    argc,
 
   __debug__ (("Creating root mount point\n"));
 
-  uid = getuid ();
   if (opt_sandbox_uid == -1)
-    opt_sandbox_uid = uid;
-  gid = getgid ();
+    opt_sandbox_uid = real_uid;
   if (opt_sandbox_gid == -1)
-    opt_sandbox_gid = gid;
+    opt_sandbox_gid = real_gid;
 
-  if (!opt_unshare_user && opt_sandbox_uid != uid)
-    die ("Specifying --uid requires --unshare-user");
+  if (!opt_unshare_user && opt_userns_fd == -1 && opt_sandbox_uid != real_uid)
+    die ("Specifying --uid requires --unshare-user or --userns");
 
-  if (!opt_unshare_user && opt_sandbox_gid != gid)
-    die ("Specifying --gid requires --unshare-user");
+  if (!opt_unshare_user && opt_userns_fd == -1 && opt_sandbox_gid != real_gid)
+    die ("Specifying --gid requires --unshare-user or --userns");
+
+  if (!opt_unshare_uts && opt_sandbox_hostname != NULL)
+    die ("Specifying --hostname requires --unshare-uts");
+
+  if (opt_as_pid_1 && !opt_unshare_pid)
+    die ("Specifying --as-pid-1 requires --unshare-pid");
+
+  if (opt_as_pid_1 && lock_files != NULL)
+    die ("Specifying --as-pid-1 and --lock-file is not permitted");
 
   /* We need to read stuff from proc during the pivot_root dance, etc.
      Lets keep a fd to it open */
-  proc_fd = open ("/proc", O_RDONLY | O_PATH);
+  proc_fd = open ("/proc", O_PATH);
   if (proc_fd == -1)
     die_with_error ("Can't open /proc");
 
   /* We need *some* mountpoint where we can mount the root tmpfs.
-     We first try in /run, and if that fails, try in /tmp. */
-  base_path = xasprintf ("/run/user/%d/.bubblewrap", uid);
-  if (mkdir (base_path, 0755) && errno != EEXIST)
-    {
-      free (base_path);
-      base_path = xasprintf ("/tmp/.bubblewrap-%d", uid);
-      if (mkdir (base_path, 0755) && errno != EEXIST)
-        die_with_error ("Creating root mountpoint failed");
-    }
+   * Because we use pivot_root, it won't appear to be mounted from
+   * the perspective of the sandboxed process, so we can use anywhere
+   * that is sure to exist, that is sure to not be a symlink controlled
+   * by someone malicious, and that we won't immediately need to
+   * access ourselves. */
+  base_path = "/tmp";
 
   __debug__ (("creating new namespace\n"));
 
-  if (opt_unshare_pid)
+  if (opt_unshare_pid && !opt_as_pid_1)
     {
       event_fd = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
       if (event_fd == -1)
@@ -1413,7 +2589,7 @@ main (int    argc,
   clone_flags = SIGCHLD | CLONE_NEWNS;
   if (opt_unshare_user)
     clone_flags |= CLONE_NEWUSER;
-  if (opt_unshare_pid)
+  if (opt_unshare_pid && opt_pidns_fd == -1)
     clone_flags |= CLONE_NEWPID;
   if (opt_unshare_net)
     clone_flags |= CLONE_NEWNET;
@@ -1433,12 +2609,40 @@ main (int    argc,
       clone_flags |= CLONE_NEWCGROUP;
     }
   if (opt_unshare_cgroup_try)
-    if (!stat ("/proc/self/ns/cgroup", &sbuf))
-      clone_flags |= CLONE_NEWCGROUP;
+    {
+      opt_unshare_cgroup = !stat ("/proc/self/ns/cgroup", &sbuf);
+      if (opt_unshare_cgroup)
+        clone_flags |= CLONE_NEWCGROUP;
+    }
 
   child_wait_fd = eventfd (0, EFD_CLOEXEC);
   if (child_wait_fd == -1)
     die_with_error ("eventfd()");
+
+  /* Track whether pre-exec setup finished if we're reporting process exit */
+  if (opt_json_status_fd != -1)
+    {
+      int ret;
+      ret = pipe2 (setup_finished_pipe, O_CLOEXEC);
+      if (ret == -1)
+        die_with_error ("pipe2()");
+    }
+
+  /* Switch to the custom user ns before the clone, gets us privs in that ns (assuming its a child of the current and thus allowed) */
+  if (opt_userns_fd > 0 && setns (opt_userns_fd, CLONE_NEWUSER) != 0)
+    {
+      if (errno == EINVAL)
+        die ("Joining the specified user namespace failed, it might not be a descendant of the current user namespace.");
+      die_with_error ("Joining specified user namespace failed");
+    }
+
+  /* Sometimes we have uninteresting intermediate pids during the setup, set up code to pass the real pid down */
+  if (opt_pidns_fd != -1)
+    {
+      /* Mark us as a subreaper, this way we can get exit status from grandchildren */
+      prctl (PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+      create_pid_socketpair (intermediate_pids_sockets);
+    }
 
   pid = raw_clone (clone_flags, NULL);
   if (pid == -1)
@@ -1459,43 +2663,137 @@ main (int    argc,
 
   if (pid != 0)
     {
-      if (is_privileged && opt_unshare_user)
+      /* Parent, outside sandbox, privileged (initially) */
+
+      if (intermediate_pids_sockets[0] != -1)
         {
-          /* Map the uid/gid 0 if opt_needs_devpts, as otherwise
-           * mounting it will fail.
-           * Due to this non-direct mapping we need to have set[ug]id
-           * caps in the parent namespaces, and thus we need to write
-           * the map in the parent namespace, not the child. */
-          write_uid_gid_map (ns_uid, uid,
-                             ns_gid, gid,
+          close (intermediate_pids_sockets[1]);
+          pid = read_pid_from_socket (intermediate_pids_sockets[0]);
+          close (intermediate_pids_sockets[0]);
+        }
+
+      /* Discover namespace ids before we drop privileges */
+      namespace_ids_read (pid);
+
+      if (is_privileged && opt_unshare_user && opt_userns_block_fd == -1)
+        {
+          /* We're running as euid 0, but the uid we want to map is
+           * not 0. This means we're not allowed to write this from
+           * the child user namespace, so we do it from the parent.
+           *
+           * Also, we map uid/gid 0 in the namespace (to overflowuid)
+           * if opt_needs_devpts is true, because otherwise the mount
+           * of devpts fails due to root not being mapped.
+           */
+          write_uid_gid_map (ns_uid, real_uid,
+                             ns_gid, real_gid,
                              pid, TRUE, opt_needs_devpts);
         }
 
-      /* Initial launched process, wait for exec:ed command to exit */
+      /* Initial launched process, wait for pid 1 or exec:ed command to exit */
 
-      /* We don't need any caps in the launcher, drop them immediately. */
-      drop_caps ();
+      if (opt_userns2_fd > 0 && setns (opt_userns2_fd, CLONE_NEWUSER) != 0)
+        die_with_error ("Setting userns2 failed");
 
-      /* Let child run */
+      /* We don't need any privileges in the launcher, drop them immediately. */
+      drop_privs (FALSE, FALSE);
+
+      /* Optionally bind our lifecycle to that of the parent */
+      handle_die_with_parent ();
+
+      if (opt_info_fd != -1)
+        {
+          cleanup_free char *output = xasprintf ("{\n    \"child-pid\": %i", pid);
+          dump_info (opt_info_fd, output, TRUE);
+          namespace_ids_write (opt_info_fd, FALSE);
+          dump_info (opt_info_fd, "\n}\n", TRUE);
+          close (opt_info_fd);
+        }
+      if (opt_json_status_fd != -1)
+        {
+          cleanup_free char *output = xasprintf ("{ \"child-pid\": %i", pid);
+          dump_info (opt_json_status_fd, output, TRUE);
+          namespace_ids_write (opt_json_status_fd, TRUE);
+          dump_info (opt_json_status_fd, " }\n", TRUE);
+        }
+
+      if (opt_userns_block_fd != -1)
+        {
+          char b[1];
+          (void) TEMP_FAILURE_RETRY (read (opt_userns_block_fd, b, 1));
+          close (opt_userns_block_fd);
+        }
+
+      /* Let child run now that the uid maps are set up */
       val = 1;
       res = write (child_wait_fd, &val, 8);
       /* Ignore res, if e.g. the child died and closed child_wait_fd we don't want to error out here */
       close (child_wait_fd);
 
-      monitor_child (event_fd);
-      exit (0); /* Should not be reached, but better safe... */
+      return monitor_child (event_fd, pid, setup_finished_pipe[0]);
     }
+
+  if (opt_pidns_fd > 0)
+    {
+      if (setns (opt_pidns_fd, CLONE_NEWPID) != 0)
+        die_with_error ("Setting pidns failed");
+
+      /* fork to get the passed in pid ns */
+      fork_intermediate_child ();
+
+      /* We might both have specified an --pidns *and* --unshare-pid, so set up a new child pid namespace under the specified one */
+      if (opt_unshare_pid)
+        {
+          if (unshare (CLONE_NEWPID))
+            die_with_error ("unshare pid ns");
+
+          /* fork to get the new pid ns */
+          fork_intermediate_child ();
+        }
+
+      /* We're back, either in a child or grandchild, so message the actual pid to the monitor */
+
+      close (intermediate_pids_sockets[0]);
+      send_pid_on_socket (intermediate_pids_sockets[1]);
+      close (intermediate_pids_sockets[1]);
+    }
+
+  /* Child, in sandbox, privileged in the parent or in the user namespace (if --unshare-user).
+   *
+   * Note that for user namespaces we run as euid 0 during clone(), so
+   * the child user namespace is owned by euid 0., This means that the
+   * regular user namespace parent (with uid != 0) doesn't have any
+   * capabilities in it, which is nice as we can't exploit those. In
+   * particular the parent user namespace doesn't have CAP_PTRACE
+   * which would otherwise allow the parent to hijack of the child
+   * after this point.
+   *
+   * Unfortunately this also means you can't ptrace the final
+   * sandboxed process from outside the sandbox either.
+   */
+
+  if (opt_info_fd != -1)
+    close (opt_info_fd);
+
+  if (opt_json_status_fd != -1)
+    close (opt_json_status_fd);
 
   /* Wait for the parent to init uid/gid maps and drop caps */
   res = read (child_wait_fd, &val, 8);
   close (child_wait_fd);
 
-  if (opt_unshare_net && loopback_setup () != 0)
-    die ("Can't create loopback device");
+  /* At this point we can completely drop root uid, but retain the
+   * required permitted caps. This allow us to do full setup as
+   * the user uid, which makes e.g. fuse access work.
+   */
+  switch_to_user_with_privs ();
+
+  if (opt_unshare_net)
+    loopback_setup (); /* Will exit if unsuccessful */
 
   ns_uid = opt_sandbox_uid;
   ns_gid = opt_sandbox_gid;
-  if (!is_privileged && opt_unshare_user)
+  if (!is_privileged && opt_unshare_user && opt_userns_block_fd == -1)
     {
       /* In the unprivileged case we have to write the uid/gid maps in
        * the child, because we have no caps in the parent */
@@ -1510,21 +2808,24 @@ main (int    argc,
           ns_gid = 0;
         }
 
-      write_uid_gid_map (ns_uid, uid,
-                         ns_gid, gid,
+      write_uid_gid_map (ns_uid, real_uid,
+                         ns_gid, real_gid,
                          -1, TRUE, FALSE);
     }
 
   old_umask = umask (0);
 
+  /* Need to do this before the chroot, but after we're the real uid */
+  resolve_symlinks_in_ops ();
+
   /* Mark everything as slave, so that we still
    * receive mounts from the real root, but don't
    * propagate mounts to the real root. */
-  if (mount (NULL, "/", NULL, MS_SLAVE | MS_REC, NULL) < 0)
+  if (mount (NULL, "/", NULL, MS_SILENT | MS_SLAVE | MS_REC, NULL) < 0)
     die_with_error ("Failed to make / slave");
 
   /* Create a tmpfs which we will use as / in the namespace */
-  if (mount ("", base_path, "tmpfs", MS_NODEV | MS_NOSUID, NULL) != 0)
+  if (mount ("tmpfs", base_path, "tmpfs", MS_NODEV | MS_NOSUID, NULL) != 0)
     die_with_error ("Failed to mount tmpfs");
 
   old_cwd = get_current_dir_name ();
@@ -1537,10 +2838,14 @@ main (int    argc,
   /* We create a subdir "$base_path/newroot" for the new root, that
    * way we can pivot_root to base_path, and put the old root at
    * "$base_path/oldroot". This avoids problems accessing the oldroot
-   * dir if the user requested to bind mount something over / */
+   * dir if the user requested to bind mount something over / (or
+   * over /tmp, now that we use that for base_path). */
 
   if (mkdir ("newroot", 0755))
     die_with_error ("Creating newroot failed");
+
+  if (mount ("newroot", "newroot", NULL, MS_SILENT | MS_MGC_VAL | MS_BIND | MS_REC, NULL) < 0)
+    die_with_error ("setting up newroot bind");
 
   if (mkdir ("oldroot", 0755))
     die_with_error ("Creating oldroot failed");
@@ -1566,15 +2871,16 @@ main (int    argc,
       if (child == 0)
         {
           /* Unprivileged setup process */
-          drop_caps ();
+          drop_privs (FALSE, TRUE);
           close (privsep_sockets[0]);
           setup_newroot (opt_unshare_pid, privsep_sockets[1]);
           exit (0);
         }
       else
         {
+          int status;
           uint32_t buffer[2048];  /* 8k, but is int32 to guarantee nice alignment */
-          uint32_t op, flags;
+          uint32_t op, flags, perms;
           const char *arg1, *arg2;
           cleanup_fd int unpriv_socket = -1;
 
@@ -1584,13 +2890,14 @@ main (int    argc,
           do
             {
               op = read_priv_sec_op (unpriv_socket, buffer, sizeof (buffer),
-                                     &flags, &arg1, &arg2);
-              privileged_op (-1, op, flags, arg1, arg2);
+                                     &flags, &perms, &arg1, &arg2);
+              privileged_op (-1, op, flags, perms, arg1, arg2);
               if (write (unpriv_socket, buffer, 1) != 1)
                 die ("Can't write to op_socket");
             }
           while (op != PRIV_SEP_OP_DONE);
 
+          waitpid (child, &status, 0);
           /* Continue post setup */
         }
     }
@@ -1599,15 +2906,52 @@ main (int    argc,
       setup_newroot (opt_unshare_pid, -1);
     }
 
+  close_ops_fd ();
+
   /* The old root better be rprivate or we will send unmount events to the parent namespace */
-  if (mount ("oldroot", "oldroot", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+  if (mount ("oldroot", "oldroot", NULL, MS_SILENT | MS_REC | MS_PRIVATE, NULL) != 0)
     die_with_error ("Failed to make old root rprivate");
 
   if (umount2 ("oldroot", MNT_DETACH))
     die_with_error ("unmount old root");
 
+  /* This is our second pivot. It's like we're a Silicon Valley startup flush
+   * with cash but short on ideas!
+   *
+   * We're aiming to make /newroot the real root, and get rid of /oldroot. To do
+   * that we need a temporary place to store it before we can unmount it.
+   */
+  { cleanup_fd int oldrootfd = open ("/", O_DIRECTORY | O_RDONLY);
+    if (oldrootfd < 0)
+      die_with_error ("can't open /");
+    if (chdir ("/newroot") != 0)
+      die_with_error ("chdir /newroot");
+    /* While the documentation claims that put_old must be underneath
+     * new_root, it is perfectly fine to use the same directory as the
+     * kernel checks only if old_root is accessible from new_root.
+     *
+     * Both runc and LXC are using this "alternative" method for
+     * setting up the root of the container:
+     *
+     * https://github.com/opencontainers/runc/blob/master/libcontainer/rootfs_linux.go#L671
+     * https://github.com/lxc/lxc/blob/master/src/lxc/conf.c#L1121
+     */
+    if (pivot_root (".", ".") != 0)
+      die_with_error ("pivot_root(/newroot)");
+    if (fchdir (oldrootfd) < 0)
+      die_with_error ("fchdir to oldroot");
+    if (umount2 (".", MNT_DETACH) < 0)
+      die_with_error ("umount old root");
+    if (chdir ("/") != 0)
+      die_with_error ("chdir /");
+  }
+
+  if (opt_userns2_fd > 0 && setns (opt_userns2_fd, CLONE_NEWUSER) != 0)
+    die_with_error ("Setting userns2 failed");
+
   if (opt_unshare_user &&
-      (ns_uid != opt_sandbox_uid || ns_gid != opt_sandbox_gid))
+      (ns_uid != opt_sandbox_uid || ns_gid != opt_sandbox_gid) &&
+      opt_userns_block_fd == -1)
     {
       /* Now that devpts is mounted and we've no need for mount
          permissions we can create a new userspace and map our uid
@@ -1616,42 +2960,37 @@ main (int    argc,
       if (unshare (CLONE_NEWUSER))
         die_with_error ("unshare user ns");
 
+      /* We're in a new user namespace, we got back the bounding set, clear it again */
+      drop_cap_bounding_set (FALSE);
+
       write_uid_gid_map (opt_sandbox_uid, ns_uid,
                          opt_sandbox_gid, ns_gid,
                          -1, FALSE, FALSE);
     }
 
-  /* Now make /newroot the real root */
-  if (chdir ("/newroot") != 0)
-    die_with_error ("chdir newroot");
-  if (chroot ("/newroot") != 0)
-    die_with_error ("chroot /newroot");
-  if (chdir ("/") != 0)
-    die_with_error ("chdir /");
+  /* All privileged ops are done now, so drop caps we don't need */
+  drop_privs (!is_privileged, TRUE);
 
-  /* Now we have everything we need CAP_SYS_ADMIN for, so drop it */
-  drop_caps ();
+  if (opt_block_fd != -1)
+    {
+      char b[1];
+      (void) TEMP_FAILURE_RETRY (read (opt_block_fd, b, 1));
+      close (opt_block_fd);
+    }
 
   if (opt_seccomp_fd != -1)
     {
-      cleanup_free char *seccomp_data = NULL;
-      size_t seccomp_len;
-      struct sock_fprog prog;
-
       seccomp_data = load_file_data (opt_seccomp_fd, &seccomp_len);
       if (seccomp_data == NULL)
         die_with_error ("Can't read seccomp data");
 
       if (seccomp_len % 8 != 0)
-        die ("Invalide seccomp data, must be multiple of 8");
+        die ("Invalid seccomp data, must be multiple of 8");
 
-      prog.len = seccomp_len / 8;
-      prog.filter = (struct sock_filter *) seccomp_data;
+      seccomp_prog.len = seccomp_len / 8;
+      seccomp_prog.filter = (struct sock_filter *) seccomp_data;
 
       close (opt_seccomp_fd);
-
-      if (prctl (PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0)
-        die_with_error ("prctl(PR_SET_SECCOMP)");
     }
 
   umask (old_umask);
@@ -1679,9 +3018,16 @@ main (int    argc,
   xsetenv ("PWD", new_cwd, 1);
   free (old_cwd);
 
+  if (opt_new_session &&
+      setsid () == (pid_t) -1)
+    die_with_error ("setsid");
+
+  if (label_exec (opt_exec_label) == -1)
+    die_with_error ("label_exec %s", argv[0]);
+
   __debug__ (("forking for child\n"));
 
-  if (opt_unshare_pid || lock_files != NULL || opt_sync_fd != -1)
+  if (!opt_as_pid_1 && (opt_unshare_pid || lock_files != NULL || opt_sync_fd != -1))
     {
       /* We have to have a pid 1 in the pid namespace, because
        * otherwise we'll get a bunch of zombies as nothing reaps
@@ -1695,6 +3041,8 @@ main (int    argc,
 
       if (pid != 0)
         {
+          drop_all_caps (FALSE);
+
           /* Close fds in pid 1, except stdio and optionally event_fd
              (for syncing pid 2 lifetime with monitor_child) and
              opt_sync_fd (for syncing sandbox lifetime with outside
@@ -1711,7 +3059,7 @@ main (int    argc,
             fdwalk (proc_fd, close_extra_fds, dont_close);
           }
 
-          return do_init (event_fd, pid);
+          return do_init (event_fd, pid, seccomp_data != NULL ? &seccomp_prog : NULL);
         }
     }
 
@@ -1720,17 +3068,50 @@ main (int    argc,
   if (proc_fd != -1)
     close (proc_fd);
 
-  if (opt_sync_fd != -1)
-    close (opt_sync_fd);
+  /* If we are using --as-pid-1 leak the sync fd into the sandbox.
+     --sync-fd will still work unless the container process doesn't close this file.  */
+  if (!opt_as_pid_1)
+    {
+      if (opt_sync_fd != -1)
+        close (opt_sync_fd);
+    }
 
   /* We want sigchild in the child */
   unblock_sigchild ();
 
-  if (label_exec (opt_exec_label) == -1)
-    die_with_error ("label_exec %s", argv[0]);
+  /* Optionally bind our lifecycle */
+  handle_die_with_parent ();
+
+  if (!is_privileged)
+    set_ambient_capabilities ();
+
+  /* Should be the last thing before execve() so that filters don't
+   * need to handle anything above */
+  if (seccomp_data != NULL &&
+      prctl (PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &seccomp_prog) != 0)
+    die_with_error ("prctl(PR_SET_SECCOMP)");
+
+  if (setup_finished_pipe[1] != -1)
+    {
+      char data = 0;
+      res = write_to_fd (setup_finished_pipe[1], &data, 1);
+      /* Ignore res, if e.g. the parent died and closed setup_finished_pipe[0]
+         we don't want to error out here */
+    }
 
   if (execvp (argv[0], argv) == -1)
-    die_with_error ("execvp %s", argv[0]);
+    {
+      if (setup_finished_pipe[1] != -1)
+        {
+          int saved_errno = errno;
+          char data = 0;
+          res = write_to_fd (setup_finished_pipe[1], &data, 1);
+          errno = saved_errno;
+          /* Ignore res, if e.g. the parent died and closed setup_finished_pipe[0]
+             we don't want to error out here */
+        }
+      die_with_error ("execvp %s", argv[0]);
+    }
 
   return 0;
 }
